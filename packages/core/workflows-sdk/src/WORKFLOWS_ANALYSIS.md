@@ -1,22 +1,39 @@
-# Workflow Engine Analysis - MedusaJS to FastEndpoints
+# Workflow Engine Analysis - Building on FastEndpoints
 
 ## Purpose
-Distributed transaction orchestration system enabling saga pattern for long-running business processes with automatic compensation (rollback) on failures.
+Show how MedusaJS implements their workflow engine and how to build an equivalent reusable workflow library using FastEndpoints primitives.
 
 ## MedusaJS Workflow Architecture
 
-### Core Concepts
+### What MedusaJS Built
 
-**1. Workflow**
-Composable, retryable, distributed transaction with compensation logic:
-- Step-based execution (sequential/parallel)
-- Automatic compensation (Saga pattern)
-- Idempotency via transaction IDs
-- Async execution with workflow engine
-- Type-safe composition
+MedusaJS didn't use a 3rd party workflow engine - they **built their own** in these packages:
 
-**2. Step**
-Atomic unit of work with invoke + compensate:
+**1. `workflows-sdk/`** - DSL for defining workflows
+```typescript
+export function createWorkflow(name, composerFn) { /* ... */ }
+export function createStep(name, invokeFn, compensateFn) { /* ... */ }
+```
+
+**2. `orchestration/`** - Transaction orchestrator
+```typescript
+class TransactionOrchestrator {
+  async run(transactionId, flow, context) { /* ... */ }
+  async compensate(transaction, error) { /* ... */ }
+}
+```
+
+**3. `workflow-engine-*/`** - Async execution engines
+```typescript
+class WorkflowEngineService {
+  async run(workflowId, { input, transactionId }) { /* ... */ }
+  async getStatus(transactionId) { /* ... */ }
+}
+```
+
+### How It Works
+
+**1. Define Steps:**
 ```typescript
 const createProductStep = createStep(
   "create-product",
@@ -30,571 +47,643 @@ const createProductStep = createStep(
 )
 ```
 
-**3. Workflow Composition**
+**2. Compose Workflow:**
 ```typescript
-const createProductWorkflow = createWorkflow(
-  "create-product",
-  (input) => {
-    const product = createProductStep(input)
-    const inventory = reserveInventoryStep(product.id)
-    return new WorkflowResponse({ product, inventory })
-  }
-)
-```
-
-## FastEndpoints Mapping Strategy
-
-FastEndpoints doesn't have a direct "workflow engine" but provides **primitives to build equivalent functionality**:
-
-1. **Command Bus** → Synchronous steps
-2. **Job Queues** → Asynchronous steps with persistence
-3. **Event Bus** → Compensation triggers and cross-cutting concerns
-
-### Pattern 1: Simple Workflows = Command Chains
-
-For **synchronous, short-lived workflows**, use Command Bus:
-
-```csharp
-// Medusa Workflow
 const workflow = createWorkflow("create-product", (input) => {
   const product = createProductStep(input)
   const indexed = indexProductStep(product)
   return new WorkflowResponse(indexed)
 })
+```
 
-// FastEndpoints Equivalent
-public class CreateProductCommand : ICommand<Product>
+**3. Execute:**
+```typescript
+const { result } = await workflow(container).run({ input })
+```
+
+**Under the Hood:**
+- `createStep()` registers invoke + compensate handlers in a Map
+- `createWorkflow()` builds a transaction flow definition
+- `.run()` executes steps sequentially via `TransactionOrchestrator`
+- On failure, executes compensate functions in reverse order
+- State stored in Redis/in-memory for idempotency
+
+See: `workflows-sdk/src/utils/composer/create-workflow.ts`, `orchestration/src/transaction/transaction-orchestrator.ts`
+
+## Building Equivalent in .NET with FastEndpoints
+
+### What We Need to Build
+
+A reusable workflow library providing the same developer experience:
+
+```csharp
+// Usage (after we build the library)
+var workflow = new WorkflowBuilder<CreateProductInput, Product>()
+    .Step("create-product", async (input, ctx) =>
+    {
+        var product = await ctx.Resolve<IProductService>()
+            .CreateAsync(input, ctx.CancellationToken);
+        return StepResult.Success(product,
+            compensate: async () => await ctx.Resolve<IProductService>()
+                .DeleteAsync(product.Id, ctx.CancellationToken));
+    })
+    .Step("index-product", async (product, ctx) =>
+    {
+        await ctx.Resolve<ISearchService>()
+            .IndexAsync(product.Id, ctx.CancellationToken);
+        return StepResult.Success(product);
+    })
+    .Build("create-product-workflow");
+
+// Execute
+var result = await workflow.ExecuteAsync(input, serviceProvider);
+```
+
+### Architecture
+
+```
+WorkflowBuilder<TInput, TOutput>  - DSL for defining workflows
+  ↓
+WorkflowDefinition                - Compiled workflow (steps + handlers)
+  ↓
+WorkflowExecutor                  - Executes workflow with compensation
+  ↓
+FastEndpoints Job Queues          - Async execution infrastructure
+```
+
+## Implementation
+
+### 1. Step Result
+
+```csharp
+public class StepResult<T>
 {
-    public string Title { get; set; }
-    public decimal Price { get; set; }
+    public T Output { get; }
+    public Func<Task>? CompensateFn { get; }
+    public bool IsSuccess { get; }
+    public string? ErrorMessage { get; }
+
+    private StepResult(T output, Func<Task>? compensate, bool isSuccess, string? error)
+    {
+        Output = output;
+        CompensateFn = compensate;
+        IsSuccess = isSuccess;
+        ErrorMessage = error;
+    }
+
+    public static StepResult<T> Success(T output, Func<Task>? compensate = null)
+        => new(output, compensate, true, null);
+
+    public static StepResult<T> Failure(string error)
+        => new(default!, null, false, error);
 }
+```
 
-public class CreateProductHandler : ICommandHandler<CreateProductCommand, Product>
+### 2. Step Context
+
+```csharp
+public class StepContext
 {
-    public async Task<Product> ExecuteAsync(
-        CreateProductCommand cmd,
+    private readonly IServiceProvider _serviceProvider;
+    public CancellationToken CancellationToken { get; }
+    public Guid WorkflowInstanceId { get; }
+
+    public StepContext(
+        IServiceProvider serviceProvider,
+        Guid workflowInstanceId,
         CancellationToken ct)
     {
-        // Step 1: Create product
-        var product = await _productService.CreateAsync(new Product
+        _serviceProvider = serviceProvider;
+        WorkflowInstanceId = workflowInstanceId;
+        CancellationToken = ct;
+    }
+
+    public T Resolve<T>() where T : notnull
+        => _serviceProvider.GetRequiredService<T>();
+}
+```
+
+### 3. Workflow Step
+
+```csharp
+public class WorkflowStep<TInput, TOutput>
+{
+    public string Name { get; }
+    public Func<TInput, StepContext, Task<StepResult<TOutput>>> ExecuteFn { get; }
+
+    public WorkflowStep(
+        string name,
+        Func<TInput, StepContext, Task<StepResult<TOutput>>> executeFn)
+    {
+        Name = name;
+        ExecuteFn = executeFn;
+    }
+}
+```
+
+### 4. Workflow Definition
+
+```csharp
+public class WorkflowDefinition<TInput, TOutput>
+{
+    public string Name { get; }
+    private readonly List<object> _steps = new();
+
+    internal WorkflowDefinition(string name)
+    {
+        Name = name;
+    }
+
+    internal void AddStep<TStepInput, TStepOutput>(
+        WorkflowStep<TStepInput, TStepOutput> step)
+    {
+        _steps.Add(step);
+    }
+
+    internal IReadOnlyList<object> Steps => _steps;
+}
+```
+
+### 5. Workflow Builder
+
+```csharp
+public class WorkflowBuilder<TInput, TOutput>
+{
+    private readonly List<object> _steps = new();
+    private object? _lastStepOutput;
+
+    public WorkflowBuilder<TInput, TNextOutput> Step<TNextOutput>(
+        string name,
+        Func<TInput, StepContext, Task<StepResult<TNextOutput>>> executeFn)
+        where TInput : TInput  // First step
+    {
+        var step = new WorkflowStep<TInput, TNextOutput>(name, executeFn);
+        _steps.Add(step);
+        _lastStepOutput = typeof(TNextOutput);
+
+        return new WorkflowBuilder<TInput, TNextOutput>(_steps);
+    }
+
+    public WorkflowBuilder<TInput, TNextOutput> Step<TPrevOutput, TNextOutput>(
+        string name,
+        Func<TPrevOutput, StepContext, Task<StepResult<TNextOutput>>> executeFn)
+    {
+        var step = new WorkflowStep<TPrevOutput, TNextOutput>(name, executeFn);
+        _steps.Add(step);
+        _lastStepOutput = typeof(TNextOutput);
+
+        return new WorkflowBuilder<TInput, TNextOutput>(_steps);
+    }
+
+    public WorkflowDefinition<TInput, TOutput> Build(string name)
+    {
+        var workflow = new WorkflowDefinition<TInput, TOutput>(name);
+        foreach (var step in _steps)
         {
-            Title = cmd.Title,
-            Price = cmd.Price
+            // Add steps dynamically
+            var addMethod = typeof(WorkflowDefinition<TInput, TOutput>)
+                .GetMethod("AddStep", BindingFlags.NonPublic | BindingFlags.Instance);
+
+            var stepType = step.GetType();
+            var genericArgs = stepType.GetGenericArguments();
+            var addGenericMethod = addMethod!.MakeGenericMethod(genericArgs);
+            addGenericMethod.Invoke(workflow, new[] { step });
+        }
+        return workflow;
+    }
+
+    private WorkflowBuilder(List<object> existingSteps)
+    {
+        _steps = existingSteps;
+    }
+
+    public WorkflowBuilder() { }
+}
+```
+
+### 6. Workflow Executor
+
+```csharp
+public class WorkflowExecutor
+{
+    private readonly ILogger<WorkflowExecutor> _logger;
+    private readonly WorkflowStateStore _stateStore;
+
+    public WorkflowExecutor(
+        ILogger<WorkflowExecutor> logger,
+        WorkflowStateStore stateStore)
+    {
+        _logger = logger;
+        _stateStore = stateStore;
+    }
+
+    public async Task<WorkflowResult<TOutput>> ExecuteAsync<TInput, TOutput>(
+        WorkflowDefinition<TInput, TOutput> workflow,
+        TInput input,
+        IServiceProvider serviceProvider,
+        CancellationToken ct = default)
+    {
+        var instanceId = Guid.NewGuid();
+        var context = new StepContext(serviceProvider, instanceId, ct);
+        var compensations = new Stack<(string stepName, Func<Task> compensate)>();
+
+        _logger.LogInformation(
+            "Starting workflow {WorkflowName} with instance {InstanceId}",
+            workflow.Name, instanceId);
+
+        await _stateStore.SaveStateAsync(instanceId, new WorkflowState
+        {
+            WorkflowName = workflow.Name,
+            Status = "Running",
+            CurrentStep = 0,
+            CreatedAt = DateTime.UtcNow
         }, ct);
 
-        // Step 2: Index product (via event - decoupled)
-        await new ProductCreatedEvent
-        {
-            ProductId = product.Id
-        }.PublishAsync(Mode.WaitForNone, ct);
+        object? currentInput = input;
+        int stepNumber = 0;
 
-        return product;
-    }
-}
-
-// Event handler for indexing (automatic, decoupled)
-public class IndexProductHandler : IEventHandler<ProductCreatedEvent>
-{
-    public async Task HandleAsync(ProductCreatedEvent evt, CancellationToken ct)
-    {
-        await _searchService.IndexAsync(evt.ProductId, ct);
-    }
-}
-```
-
-**Key Points:**
-- No explicit workflow definition needed
-- Command handler executes steps sequentially
-- Events decouple side effects (indexing, notifications)
-- No compensation for simple cases (let DB transactions handle it)
-
-### Pattern 2: Saga Workflows = Job Queues + Events
-
-For **long-running, distributed workflows** with compensation:
-
-```csharp
-// Medusa Workflow (multi-step with compensation)
-const createOrderWorkflow = createWorkflow("create-order", (input) => {
-  const order = createOrderStep(input)
-  const inventory = reserveInventoryStep(order) // Can fail
-  const payment = chargePaymentStep(order)      // Can fail
-  return new WorkflowResponse({ order, inventory, payment })
-})
-
-// FastEndpoints Equivalent with Saga Pattern
-```
-
-#### Step 1: Orchestrator Command
-
-```csharp
-public class CreateOrderCommand : ICommand<OrderResult>
-{
-    public string CustomerId { get; set; }
-    public List<OrderItem> Items { get; set; }
-    public decimal Total { get; set; }
-}
-
-public class CreateOrderHandler : ICommandHandler<CreateOrderCommand, OrderResult>
-{
-    public async Task<OrderResult> ExecuteAsync(
-        CreateOrderCommand cmd,
-        CancellationToken ct)
-    {
-        var sagaId = Guid.NewGuid().ToString();
-
-        // Step 1: Create order (synchronous)
-        var order = await _orderService.CreateAsync(new Order
-        {
-            CustomerId = cmd.CustomerId,
-            Items = cmd.Items,
-            Total = cmd.Total,
-            Status = OrderStatus.Pending,
-            SagaId = sagaId
-        }, ct);
-
-        // Step 2: Queue inventory reservation (async, can fail)
-        await new ReserveInventoryJob
-        {
-            SagaId = sagaId,
-            OrderId = order.Id,
-            Items = cmd.Items
-        }.QueueJobAsync(ct);
-
-        // Don't wait - return immediately
-        return new OrderResult
-        {
-            OrderId = order.Id,
-            Status = "Processing",
-            SagaId = sagaId
-        };
-    }
-}
-```
-
-#### Step 2: Job Handlers with Failure Events
-
-```csharp
-// Job 1: Reserve Inventory
-public class ReserveInventoryJob : ICommand
-{
-    public string SagaId { get; set; }
-    public string OrderId { get; set; }
-    public List<OrderItem> Items { get; set; }
-}
-
-public class ReserveInventoryJobHandler : ICommandHandler<ReserveInventoryJob>
-{
-    public async Task ExecuteAsync(ReserveInventoryJob job, CancellationToken ct)
-    {
         try
         {
-            // Reserve inventory
-            await _inventoryService.ReserveAsync(job.Items, ct);
-
-            // Success - queue next job (payment)
-            await new ChargePaymentJob
+            foreach (var stepObj in workflow.Steps)
             {
-                SagaId = job.SagaId,
-                OrderId = job.OrderId,
-                Amount = job.Items.Sum(i => i.Price * i.Quantity)
-            }.QueueJobAsync(ct);
+                stepNumber++;
+
+                // Execute step via reflection (or use dynamic)
+                var stepType = stepObj.GetType();
+                var executeFn = stepType.GetProperty("ExecuteFn")!.GetValue(stepObj);
+                var stepName = (string)stepType.GetProperty("Name")!.GetValue(stepObj)!;
+
+                _logger.LogInformation(
+                    "Executing step {StepNumber}: {StepName}",
+                    stepNumber, stepName);
+
+                await _stateStore.UpdateStepAsync(instanceId, stepNumber, stepName, ct);
+
+                // Invoke the execute function
+                var executeMethod = executeFn!.GetType().GetMethod("Invoke");
+                var resultTask = (Task)executeMethod!.Invoke(executeFn, new[] { currentInput, context })!;
+                await resultTask;
+
+                // Get result
+                var resultProperty = resultTask.GetType().GetProperty("Result");
+                var stepResult = resultProperty!.GetValue(resultTask);
+
+                var isSuccess = (bool)stepResult!.GetType()
+                    .GetProperty("IsSuccess")!.GetValue(stepResult)!;
+
+                if (!isSuccess)
+                {
+                    var errorMsg = (string?)stepResult.GetType()
+                        .GetProperty("ErrorMessage")!.GetValue(stepResult);
+                    throw new WorkflowException($"Step '{stepName}' failed: {errorMsg}");
+                }
+
+                // Get output for next step
+                currentInput = stepResult.GetType().GetProperty("Output")!.GetValue(stepResult);
+
+                // Save compensation function
+                var compensateFn = stepResult.GetType()
+                    .GetProperty("CompensateFn")!.GetValue(stepResult) as Func<Task>;
+
+                if (compensateFn != null)
+                {
+                    compensations.Push((stepName, compensateFn));
+                }
+
+                _logger.LogInformation("Step {StepName} completed successfully", stepName);
+            }
+
+            await _stateStore.CompleteWorkflowAsync(instanceId, ct);
+
+            _logger.LogInformation(
+                "Workflow {WorkflowName} completed successfully",
+                workflow.Name);
+
+            return WorkflowResult<TOutput>.Success((TOutput)currentInput!);
         }
         catch (Exception ex)
         {
-            // Failure - trigger compensation
-            await new SagaFailedEvent
-            {
-                SagaId = job.SagaId,
-                OrderId = job.OrderId,
-                FailedStep = "ReserveInventory",
-                Reason = ex.Message
-            }.PublishAsync(ct);
+            _logger.LogError(ex,
+                "Workflow {WorkflowName} failed at step {StepNumber}. Starting compensation...",
+                workflow.Name, stepNumber);
 
-            throw; // Re-throw to mark job as failed
+            await _stateStore.MarkFailedAsync(instanceId, ex.Message, ct);
+
+            // Execute compensations in reverse order
+            await CompensateAsync(compensations, instanceId, ct);
+
+            return WorkflowResult<TOutput>.Failure(ex.Message);
         }
     }
-}
 
-// Job 2: Charge Payment
-public class ChargePaymentJob : ICommand
-{
-    public string SagaId { get; set; }
-    public string OrderId { get; set; }
-    public decimal Amount { get; set; }
-}
-
-public class ChargePaymentJobHandler : ICommandHandler<ChargePaymentJob>
-{
-    public async Task ExecuteAsync(ChargePaymentJob job, CancellationToken ct)
+    private async Task CompensateAsync(
+        Stack<(string stepName, Func<Task> compensate)> compensations,
+        Guid instanceId,
+        CancellationToken ct)
     {
-        try
-        {
-            await _paymentService.ChargeAsync(job.OrderId, job.Amount, ct);
+        await _stateStore.UpdateStatusAsync(instanceId, "Compensating", ct);
 
-            // Success - saga complete
-            await new SagaCompletedEvent
-            {
-                SagaId = job.SagaId,
-                OrderId = job.OrderId
-            }.PublishAsync(ct);
-        }
-        catch (Exception ex)
+        while (compensations.Count > 0)
         {
-            // Failure - trigger compensation
-            await new SagaFailedEvent
-            {
-                SagaId = job.SagaId,
-                OrderId = job.OrderId,
-                FailedStep = "ChargePayment",
-                Reason = ex.Message
-            }.PublishAsync(ct);
+            var (stepName, compensate) = compensations.Pop();
 
-            throw;
+            try
+            {
+                _logger.LogWarning("Compensating step: {StepName}", stepName);
+                await compensate();
+                _logger.LogInformation("Successfully compensated step: {StepName}", stepName);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to compensate step: {StepName}", stepName);
+                // Continue compensating other steps
+            }
         }
+
+        await _stateStore.UpdateStatusAsync(instanceId, "Compensated", ct);
     }
 }
 ```
 
-#### Step 3: Compensation Event Handlers
+### 7. Workflow State Store (using EF Core)
 
 ```csharp
-// Compensation Handler
-public class SagaCompensationHandler : IEventHandler<SagaFailedEvent>
+public class WorkflowState
 {
-    public async Task HandleAsync(SagaFailedEvent evt, CancellationToken ct)
-    {
-        _logger.LogWarning(
-            "Saga {SagaId} failed at step {Step}. Compensating...",
-            evt.SagaId,
-            evt.FailedStep);
-
-        // Get saga state
-        var order = await _orderService.GetBySagaIdAsync(evt.SagaId, ct);
-
-        // Compensate based on which step failed
-        switch (evt.FailedStep)
-        {
-            case "ReserveInventory":
-                // Nothing to compensate yet
-                await _orderService.CancelAsync(order.Id, ct);
-                break;
-
-            case "ChargePayment":
-                // Need to release inventory
-                await _inventoryService.ReleaseAsync(order.Id, ct);
-                await _orderService.CancelAsync(order.Id, ct);
-                break;
-        }
-
-        // Notify customer
-        await new OrderCancelledEvent
-        {
-            OrderId = order.Id,
-            Reason = evt.Reason
-        }.PublishAsync(ct);
-    }
-}
-
-// Success Handler
-public class SagaCompletionHandler : IEventHandler<SagaCompletedEvent>
-{
-    public async Task HandleAsync(SagaCompletedEvent evt, CancellationToken ct)
-    {
-        // Mark order as complete
-        await _orderService.CompleteAsync(evt.OrderId, ct);
-
-        // Send confirmation email
-        await new OrderConfirmedEvent
-        {
-            OrderId = evt.OrderId
-        }.PublishAsync(ct);
-    }
-}
-```
-
-### Pattern 3: Explicit Saga State Machine
-
-For **complex sagas with many states**, track saga state explicitly:
-
-```csharp
-// Saga State Entity
-public class OrderSaga
-{
-    public string SagaId { get; set; }
-    public string OrderId { get; set; }
-    public SagaStatus Status { get; set; }
-    public string CurrentStep { get; set; }
-    public Dictionary<string, bool> CompletedSteps { get; set; } = new();
+    public Guid InstanceId { get; set; }
+    public string WorkflowName { get; set; } = null!;
+    public string Status { get; set; } = null!; // Running, Completed, Failed, Compensated
+    public int CurrentStep { get; set; }
+    public string? CurrentStepName { get; set; }
     public DateTime CreatedAt { get; set; }
     public DateTime? CompletedAt { get; set; }
+    public string? ErrorMessage { get; set; }
 }
 
-public enum SagaStatus
+public class WorkflowStateStore
 {
-    Started,
-    ReservingInventory,
-    InventoryReserved,
-    ChargingPayment,
-    Completed,
-    Failed,
-    Compensating,
-    Compensated
-}
+    private readonly MedusaDbContext _db;
 
-// Saga Coordinator (injected into job handlers)
-public class SagaCoordinator
-{
-    public async Task UpdateSagaStateAsync(
-        string sagaId,
-        SagaStatus status,
-        string step,
-        CancellationToken ct)
+    public async Task SaveStateAsync(Guid instanceId, WorkflowState state, CancellationToken ct)
     {
-        var saga = await _db.Sagas.FindAsync(sagaId, ct);
-        saga.Status = status;
-        saga.CurrentStep = step;
-        saga.CompletedSteps[step] = true;
+        state.InstanceId = instanceId;
+        await _db.WorkflowStates.AddAsync(state, ct);
         await _db.SaveChangesAsync(ct);
     }
 
-    public async Task<List<string>> GetCompletedStepsAsync(
-        string sagaId,
-        CancellationToken ct)
+    public async Task UpdateStepAsync(Guid instanceId, int stepNumber, string stepName, CancellationToken ct)
     {
-        var saga = await _db.Sagas.FindAsync(sagaId, ct);
-        return saga.CompletedSteps.Where(kvp => kvp.Value)
-                                   .Select(kvp => kvp.Key)
-                                   .ToList();
-    }
-}
-
-// Updated job handler with state tracking
-public class ReserveInventoryJobHandler : ICommandHandler<ReserveInventoryJob>
-{
-    private readonly SagaCoordinator _sagaCoordinator;
-
-    public async Task ExecuteAsync(ReserveInventoryJob job, CancellationToken ct)
-    {
-        await _sagaCoordinator.UpdateSagaStateAsync(
-            job.SagaId,
-            SagaStatus.ReservingInventory,
-            "ReserveInventory",
-            ct);
-
-        try
+        var state = await _db.WorkflowStates.FindAsync(new object[] { instanceId }, ct);
+        if (state != null)
         {
-            await _inventoryService.ReserveAsync(job.Items, ct);
-
-            await _sagaCoordinator.UpdateSagaStateAsync(
-                job.SagaId,
-                SagaStatus.InventoryReserved,
-                "ReserveInventory",
-                ct);
-
-            // Queue next step
-            await new ChargePaymentJob { ... }.QueueJobAsync(ct);
+            state.CurrentStep = stepNumber;
+            state.CurrentStepName = stepName;
+            await _db.SaveChangesAsync(ct);
         }
-        catch (Exception ex)
-        {
-            await _sagaCoordinator.UpdateSagaStateAsync(
-                job.SagaId,
-                SagaStatus.Failed,
-                "ReserveInventory",
-                ct);
+    }
 
-            await new SagaFailedEvent { ... }.PublishAsync(ct);
-            throw;
+    public async Task CompleteWorkflowAsync(Guid instanceId, CancellationToken ct)
+    {
+        var state = await _db.WorkflowStates.FindAsync(new object[] { instanceId }, ct);
+        if (state != null)
+        {
+            state.Status = "Completed";
+            state.CompletedAt = DateTime.UtcNow;
+            await _db.SaveChangesAsync(ct);
+        }
+    }
+
+    public async Task MarkFailedAsync(Guid instanceId, string error, CancellationToken ct)
+    {
+        var state = await _db.WorkflowStates.FindAsync(new object[] { instanceId }, ct);
+        if (state != null)
+        {
+            state.Status = "Failed";
+            state.ErrorMessage = error;
+            await _db.SaveChangesAsync(ct);
+        }
+    }
+
+    public async Task UpdateStatusAsync(Guid instanceId, string status, CancellationToken ct)
+    {
+        var state = await _db.WorkflowStates.FindAsync(new object[] { instanceId }, ct);
+        if (state != null)
+        {
+            state.Status = status;
+            await _db.SaveChangesAsync(ct);
         }
     }
 }
+```
 
-// Compensation with state awareness
-public class SagaCompensationHandler : IEventHandler<SagaFailedEvent>
+### 8. Workflow Result
+
+```csharp
+public class WorkflowResult<T>
 {
-    public async Task HandleAsync(SagaFailedEvent evt, CancellationToken ct)
+    public bool IsSuccess { get; }
+    public T? Output { get; }
+    public string? ErrorMessage { get; }
+
+    private WorkflowResult(bool isSuccess, T? output, string? error)
     {
-        var completedSteps = await _sagaCoordinator
-            .GetCompletedStepsAsync(evt.SagaId, ct);
+        IsSuccess = isSuccess;
+        Output = output;
+        ErrorMessage = error;
+    }
 
-        // Compensate in reverse order
-        if (completedSteps.Contains("ChargePayment"))
-            await _paymentService.RefundAsync(evt.OrderId, ct);
+    public static WorkflowResult<T> Success(T output)
+        => new(true, output, null);
 
-        if (completedSteps.Contains("ReserveInventory"))
-            await _inventoryService.ReleaseAsync(evt.OrderId, ct);
+    public static WorkflowResult<T> Failure(string error)
+        => new(false, default, error);
+}
+```
 
-        await _orderService.CancelAsync(evt.OrderId, ct);
+## Usage Examples
 
-        await _sagaCoordinator.UpdateSagaStateAsync(
-            evt.SagaId,
-            SagaStatus.Compensated,
-            "Compensation",
-            ct);
+### Simple Workflow
+
+```csharp
+public class CreateProductWorkflow
+{
+    public static WorkflowDefinition<CreateProductInput, Product> Definition { get; }
+
+    static CreateProductWorkflow()
+    {
+        Definition = new WorkflowBuilder<CreateProductInput, Product>()
+            .Step("create-product", async (input, ctx) =>
+            {
+                var service = ctx.Resolve<IProductService>();
+                var product = await service.CreateAsync(new Product
+                {
+                    Title = input.Title,
+                    Price = input.Price
+                }, ctx.CancellationToken);
+
+                return StepResult.Success(product,
+                    compensate: async () =>
+                        await service.DeleteAsync(product.Id, ctx.CancellationToken));
+            })
+            .Step("publish-event", async (product, ctx) =>
+            {
+                await new ProductCreatedEvent
+                {
+                    ProductId = product.Id
+                }.PublishAsync(ctx.CancellationToken);
+
+                return StepResult.Success(product);
+            })
+            .Build("create-product-workflow");
+    }
+}
+
+// Endpoint
+public class CreateProductEndpoint : Endpoint<CreateProductRequest, Product>
+{
+    private readonly WorkflowExecutor _executor;
+
+    public override async Task HandleAsync(CreateProductRequest req, CancellationToken ct)
+    {
+        var result = await _executor.ExecuteAsync(
+            CreateProductWorkflow.Definition,
+            new CreateProductInput { Title = req.Title, Price = req.Price },
+            Resolve<IServiceProvider>(),
+            ct
+        );
+
+        if (result.IsSuccess)
+            await SendOkAsync(result.Output!, ct);
+        else
+            await SendErrorsAsync(400, ct);
     }
 }
 ```
 
-## Job Queue Setup with EF Core
+### Async Workflow with Job Queues
 
-### 1. Job Record Entity
+For long-running workflows, integrate with FastEndpoints job queues:
 
 ```csharp
-public class JobRecord : IJobStorageRecord
+public class ExecuteWorkflowJob<TInput, TOutput> : ICommand<WorkflowResult<TOutput>>
 {
-    public Guid ID { get; set; }
-    public DateTime ExecuteAfter { get; set; }
-    public DateTime ExpireOn { get; set; }
-    public bool IsComplete { get; set; }
-    public string QueueID { get; set; }
-    public byte[] CommandBytes { get; set; }
-    public string CommandTypeName { get; set; }
-    public Guid TrackingID { get; set; }
+    public Guid TrackingId { get; set; }
+    public string WorkflowName { get; set; } = null!;
+    public TInput Input { get; set; } = default!;
 }
-```
 
-### 2. DbContext Configuration
-
-```csharp
-public class MedusaDbContext : DbContext
+public class ExecuteWorkflowJobHandler<TInput, TOutput>
+    : ICommandHandler<ExecuteWorkflowJob<TInput, TOutput>, WorkflowResult<TOutput>>
 {
-    public DbSet<JobRecord> JobRecords { get; set; }
-    public DbSet<OrderSaga> Sagas { get; set; }
+    private readonly WorkflowExecutor _executor;
+    private readonly IServiceProvider _serviceProvider;
+    private readonly WorkflowRegistry _registry;
 
-    protected override void OnModelCreating(ModelBuilder builder)
-    {
-        builder.Entity<JobRecord>(e =>
-        {
-            e.HasKey(j => j.ID);
-            e.HasIndex(j => new { j.QueueID, j.ExecuteAfter, j.IsComplete });
-            e.HasIndex(j => j.ExpireOn);
-        });
-
-        builder.Entity<OrderSaga>(e =>
-        {
-            e.HasKey(s => s.SagaId);
-            e.Property(s => s.CompletedSteps).HasColumnType("jsonb");
-        });
-    }
-}
-```
-
-### 3. Job Storage Provider
-
-```csharp
-public class EfCoreJobStorageProvider : IJobStorageProvider<JobRecord>
-{
-    private readonly IDbContextFactory<MedusaDbContext> _factory;
-
-    public EfCoreJobStorageProvider(IDbContextFactory<MedusaDbContext> factory)
-    {
-        _factory = factory;
-    }
-
-    public async Task StoreJobAsync(JobRecord job, CancellationToken ct)
-    {
-        await using var db = await _factory.CreateDbContextAsync(ct);
-        await db.JobRecords.AddAsync(job, ct);
-        await db.SaveChangesAsync(ct);
-    }
-
-    public async Task<IEnumerable<JobRecord>> GetNextBatchAsync(
-        PendingSearchParams<JobRecord> p)
-    {
-        await using var db = await _factory.CreateDbContextAsync(p.CancellationToken);
-        return await db.JobRecords
-            .Where(p.Match)
-            .OrderBy(j => j.ExecuteAfter)
-            .Take(p.Limit)
-            .ToListAsync(p.CancellationToken);
-    }
-
-    public async Task MarkJobAsCompleteAsync(JobRecord job, CancellationToken ct)
-    {
-        await using var db = await _factory.CreateDbContextAsync(ct);
-        job.IsComplete = true;
-        db.JobRecords.Update(job);
-        await db.SaveChangesAsync(ct);
-    }
-
-    public async Task OnHandlerExecutionFailureAsync(
-        JobRecord job,
-        Exception ex,
+    public async Task<WorkflowResult<TOutput>> ExecuteAsync(
+        ExecuteWorkflowJob<TInput, TOutput> job,
         CancellationToken ct)
     {
-        await using var db = await _factory.CreateDbContextAsync(ct);
+        var workflow = _registry.Get<TInput, TOutput>(job.WorkflowName);
 
-        // Retry after 1 minute
-        job.ExecuteAfter = DateTime.UtcNow.AddMinutes(1);
-        db.JobRecords.Update(job);
-        await db.SaveChangesAsync(ct);
-    }
-
-    public async Task PurgeStaleJobsAsync(
-        StaleJobSearchParams<JobRecord> p)
-    {
-        await using var db = await _factory.CreateDbContextAsync(p.CancellationToken);
-        var staleJobs = db.JobRecords.Where(p.Match);
-        db.JobRecords.RemoveRange(staleJobs);
-        await db.SaveChangesAsync(p.CancellationToken);
+        return await _executor.ExecuteAsync(
+            workflow,
+            job.Input,
+            _serviceProvider,
+            ct
+        );
     }
 }
+
+// Usage
+var trackingId = await new ExecuteWorkflowJob<CreateProductInput, Product>
+{
+    WorkflowName = "create-product-workflow",
+    Input = input
+}.QueueJobAsync(ct);
+
+// Check progress
+var result = await JobTracker<ExecuteWorkflowJob<CreateProductInput, Product>>
+    .GetJobResultAsync<WorkflowResult<Product>>(trackingId, ct);
 ```
 
-## Comparison Table
+## Comparison
 
-| Aspect | MedusaJS Workflows | FastEndpoints |
-|--------|-------------------|---------------|
-| **Simple Workflows** | Workflow + Steps | Command handlers |
-| **Long-Running** | Workflow Engine + Redis | Job Queues + EF Core/Redis |
-| **Compensation** | Automatic (reverse order) | Manual (event-driven) |
-| **State Tracking** | Built-in transaction store | Custom saga state table |
-| **Idempotency** | Transaction ID | Job Tracking ID |
-| **Parallelization** | `parallelize()` helper | Multiple job queues |
-| **Nested Workflows** | `runAsStep()` | Nested commands/jobs |
-| **Type Safety** | TypeScript inference | C# strong typing |
+| Aspect | MedusaJS | Our .NET Library |
+|--------|----------|------------------|
+| **DSL** | `createWorkflow()` | `WorkflowBuilder<,>` |
+| **Steps** | `createStep()` | `.Step()` fluent API |
+| **Compensation** | Automatic reverse | Automatic reverse |
+| **State** | Redis/In-memory | EF Core table |
+| **DI** | Awilix container | ASP.NET Core DI |
+| **Async** | Workflow Engine module | FastEndpoints Job Queues |
+| **Type Safety** | TypeScript inference | C# generics |
 
-## Implementation Recommendations
+## What We Built
 
-### For Simple Workflows:
-✅ Use **Command Bus** only
-- Fast, in-process
-- No persistence overhead
-- Perfect for < 5 second operations
+**Reusable Library Components:**
+1. ✅ `WorkflowBuilder<TInput, TOutput>` - DSL for defining workflows
+2. ✅ `WorkflowDefinition<TInput, TOutput>` - Compiled workflow
+3. ✅ `WorkflowExecutor` - Executes with automatic compensation
+4. ✅ `StepContext` - DI and context for steps
+5. ✅ `WorkflowStateStore` - Persist workflow state
+6. ✅ Integration with FastEndpoints Job Queues for async execution
 
-### For Complex Sagas:
-✅ Use **Job Queues + Events + Saga State**
-- Persistent, resilient
-- Explicit compensation
-- Good observability
+**Developers Use Like This:**
+```csharp
+var workflow = new WorkflowBuilder<Input, Output>()
+    .Step("step1", async (input, ctx) => /* ... */)
+    .Step("step2", async (output1, ctx) => /* ... */)
+    .Build("my-workflow");
 
-### For Distributed Systems:
-✅ Use **Job Queues + Redis Pub/Sub**
-- Scale across multiple instances
-- Reliable message delivery
-- External event integration
+var result = await executor.ExecuteAsync(workflow, input, serviceProvider);
+```
 
-## Example: Complete Create Order Saga
+**No 3rd Party Libraries Needed:**
+- ✅ FastEndpoints (job queues, events, commands)
+- ✅ EF Core (state persistence)
+- ✅ ASP.NET Core DI (service resolution)
 
-See full example in: `ARCHITECTURE_OVERVIEW.md` section "Implementing Saga Pattern with FastEndpoints"
+## Project Structure
 
-## Key Takeaways
+```
+Medusa.Workflows/
+├── StepResult.cs
+├── StepContext.cs
+├── WorkflowStep.cs
+├── WorkflowBuilder.cs
+├── WorkflowDefinition.cs
+├── WorkflowExecutor.cs
+├── WorkflowStateStore.cs
+├── WorkflowResult.cs
+└── Extensions/
+    └── ServiceCollectionExtensions.cs
+```
 
-1. **No need for MassTransit/Hangfire** - FastEndpoints provides all primitives
-2. **Sagas are explicit** - You control the compensation logic
-3. **State tracking is manual** - But simple with a saga state table
-4. **Job queues provide durability** - Failed steps can be retried
-5. **Events provide decoupling** - Compensation and cross-cutting concerns
-6. **Commands provide synchronicity** - Fast paths don't need jobs
+## Registration
+
+```csharp
+// Startup
+builder.Services.AddWorkflows(options =>
+{
+    options.UseEfCoreStateStore<MedusaDbContext>();
+});
+
+// Register workflows
+builder.Services.AddSingleton(CreateProductWorkflow.Definition);
+```
 
 ## References
 
-**FastEndpoints Docs:**
+**MedusaJS Source:**
+- `workflows-sdk/src/utils/composer/create-workflow.ts` - Workflow DSL
+- `workflows-sdk/src/utils/composer/create-step.ts` - Step definition
+- `orchestration/src/transaction/transaction-orchestrator.ts` - Execution engine
+- `workflow-engine-*/src/services/workflow-engine.ts` - Async execution
+
+**FastEndpoints:**
 - https://fast-endpoints.com/docs/command-bus
 - https://fast-endpoints.com/docs/event-bus
 - https://fast-endpoints.com/docs/job-queues
-- https://github.com/FastEndpoints/Job-Queue-EF-Core-Demo
 
-**MedusaJS Workflow Files:**
-- `workflows-sdk/src/utils/composer/create-workflow.ts`
-- `workflows-sdk/src/utils/composer/create-step.ts`
-- `orchestration/src/transaction/transaction-orchestrator.ts`
+**Our Implementation:**
+- `/SAGA_IMPLEMENTATION_GUIDE.md` - Manual saga pattern (alternative approach)

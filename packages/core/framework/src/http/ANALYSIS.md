@@ -303,11 +303,11 @@ await SendErrorsAsync(400, ct);
 ```
 
 ### Key .NET Packages
-- **FastEndpoints** - Endpoint routing
-- **FluentValidation** - Request validation
+- **FastEndpoints** - Endpoint routing (includes Command Bus, Event Bus, Job Queues)
 - **Microsoft.AspNetCore.Authentication.JwtBearer** - JWT auth
 - **Swashbuckle.AspNetCore** - OpenAPI/Swagger
-- **MediatR** (optional) - REPR pattern
+
+**Note:** FluentValidation and MediatR are NOT needed - FastEndpoints includes validation and command bus natively.
 
 ### FastEndpoints Configuration
 ```csharp
