@@ -1,472 +1,22 @@
-# Workflow Engine Analysis - MedusaJS
+# Workflow Engine Analysis - MedusaJS to FastEndpoints
 
 ## Purpose
 Distributed transaction orchestration system enabling saga pattern for long-running business processes with automatic compensation (rollback) on failures.
 
-## Core Concepts
+## MedusaJS Workflow Architecture
 
-### 1. Workflow
+### Core Concepts
+
+**1. Workflow**
 Composable, retryable, distributed transaction with compensation logic:
-- **Step-based execution** - Sequential/parallel task execution
-- **Automatic compensation** - Rollback on failures (Saga pattern)
-- **Idempotency** - Safe retries via transaction IDs
-- **Async execution** - Background processing with workflow engine
-- **Type-safe composition** - Full TypeScript inference
-
-### 2. Step
-Atomic unit of work with invoke + compensate functions:
-- **Invoke**: Forward execution (e.g., create product)
-- **Compensate**: Rollback (e.g., delete product)
-- **StepResponse**: Output + compensation input
-- **Async/Sync modes**: Immediate or background execution
-
-### 3. Orchestration Engine
-Manages workflow execution state:
-- **Transaction tracking** - Stores step results and state
-- **Compensation orchestration** - Auto-executes rollbacks
-- **Event emission** - Progress tracking
-- **Storage backends** - In-memory or Redis
-
-## Architecture
-
-### **1. Workflow Definition** (`create-workflow.ts`)
-
-```typescript
-const createProductWorkflow = createWorkflow(
-  "create-product",
-  (input: WorkflowData<ProductInput>) => {
-    const product = createProductStep(input)
-    const inventory = reserveInventoryStep(product.id)
-    const notification = sendEmailStep({
-      product: product,
-      inventory: inventory
-    })
-
-    return new WorkflowResponse({
-      product,
-      inventory
-    })
-  }
-)
-```
-
-**Execution:**
-```typescript
-const { result, transaction } = await createProductWorkflow(container).run({
-  input: { title: "Shirt", price: 1000 }
-})
-```
-
-**Key Mechanisms:**
-- **Proxify pattern**: Input/outputs are proxies tracking dependencies
-- **Composer context**: Global state during composition
-- **WorkflowManager**: Registry of all workflows
-- **Handler Map**: Step name → invoke/compensate functions
-
-See: `workflows-sdk/src/utils/composer/create-workflow.ts`
-
-### **2. Step Definition** (`create-step.ts`)
-
-```typescript
-const createProductStep = createStep(
-  "create-product",
-  async (input: ProductInput, { container }) => {
-    const productService = container.resolve("productService")
-    const product = await productService.create(input)
-
-    return new StepResponse(
-      product,                    // Output (passed to next steps)
-      { productId: product.id }   // Compensation input
-    )
-  },
-  async (compensationInput, { container }) => {
-    if (!compensationInput) return
-
-    const productService = container.resolve("productService")
-    await productService.delete(compensationInput.productId)
-  }
-)
-```
-
-**Features:**
-- **Conditional execution**: `step.if(condition, fn)`
-- **Config override**: `step.config({ async: true })`
-- **Dependency injection**: Via `container` in context
-- **Automatic compensation**: Executed in reverse order on error
-
-See: `workflows-sdk/src/utils/composer/create-step.ts`
-
-### **3. StepResponse** (`helpers/step-response.ts`)
-
-Wrapper for step output + compensation data:
-
-```typescript
-class StepResponse<TOutput, TCompensateInput> {
-  constructor(
-    public output: TOutput,
-    public compensateInput?: TCompensateInput
-  ) {}
-
-  static skip() {
-    // Skip step execution (conditional)
-  }
-}
-```
-
-If `compensateInput` not provided, `output` is used for compensation.
-
-### **4. Workflow Execution Flow**
-
-**Registration Phase (Build Time):**
-```
-createWorkflow("name", composer)
-→ Creates composer context
-→ Executes composer with proxied input
-→ Builds transaction flow definition
-→ Registers handlers in WorkflowManager
-→ Returns executable workflow function
-```
-
-**Execution Phase (Runtime):**
-```
-workflow(container).run({ input })
-→ WorkflowManager.run(name, input, context)
-→ DistributedTransaction.begin()
-→ For each step in order:
-  → Resolve input dependencies from previous steps
-  → Execute step.invoke(resolvedInput, context)
-  → Store result in transaction state
-  → Emit step.completed event
-→ If error occurs:
-  → Execute compensation steps in reverse
-  → Emit workflow.failed event
-→ Else:
-  → Emit workflow.completed event
-→ Return { result, transaction }
-```
-
-### **5. Transaction Orchestrator** (`orchestration/transaction-orchestrator.ts`)
-
-Manages step execution and compensation:
-
-```typescript
-class TransactionOrchestrator {
-  async run(transactionId, flow, context) {
-    const transaction = new DistributedTransaction(
-      transactionId,
-      flow,
-      this.storage
-    )
-
-    for (const step of flow.steps) {
-      try {
-        const input = this.resolveStepInput(step, transaction)
-        const result = await this.handlers[step.name].invoke({
-          input,
-          container: context.container,
-          transaction
-        })
-
-        transaction.addStepSuccess(step, result)
-      } catch (error) {
-        await this.compensate(transaction, error)
-        throw error
-      }
-    }
-
-    return transaction.getResult()
-  }
-
-  async compensate(transaction, error) {
-    const completedSteps = transaction.getCompletedSteps().reverse()
-
-    for (const step of completedSteps) {
-      if (step.noCompensation) continue
-
-      const compensateInput = transaction.getCompensateInput(step)
-      await this.handlers[step.name].compensate({
-        input: compensateInput,
-        container: context.container,
-        transaction
-      })
-    }
-  }
-}
-```
-
-See: `orchestration/src/transaction/transaction-orchestrator.ts`
-
-### **6. Distributed Transaction** (`orchestration/distributed-transaction.ts`)
-
-Tracks execution state:
-
-```typescript
-class DistributedTransaction {
-  private state: {
-    steps: Map<string, StepResult>
-    status: "idle" | "executing" | "completed" | "failed"
-    errors: Error[]
-  }
-
-  addStepSuccess(step, result) {
-    this.state.steps.set(step.name, {
-      status: "success",
-      output: result.output,
-      compensateInput: result.compensateInput
-    })
-  }
-
-  async persist() {
-    await this.storage.save(this.transactionId, this.state)
-  }
-
-  async resume() {
-    const state = await this.storage.load(this.transactionId)
-    this.state = state
-    // Continue from last completed step
-  }
-}
-```
-
-### **7. Workflow Engine Service** (Modules)
-
-For async/background workflows:
-
-```typescript
-// Workflow engine module
-interface IWorkflowEngineService {
-  async run(workflowId, { input, transactionId, context }) {
-    // Queue workflow for background execution
-    await this.queue.add({
-      workflowId,
-      input,
-      transactionId,
-      context
-    })
-
-    return { transactionId, status: "pending" }
-  }
-
-  async getStatus(transactionId) {
-    return this.storage.getTransaction(transactionId)
-  }
-
-  async cancel(workflowId, { transactionId }) {
-    // Execute compensation for transaction
-    await this.orchestrator.compensate(transactionId)
-  }
-}
-```
-
-Implementations:
-- **workflow-engine-inmemory**: In-process execution
-- **workflow-engine-redis**: Redis-backed queue
-
-See: `modules/workflow-engine-*/src/services/workflow-engine.ts`
-
-### **8. Parallel Execution** (`parallelize.ts`)
-
-Execute steps concurrently:
-
-```typescript
-const { productA, productB } = parallelize(
-  createProductStep({ title: "A" }),
-  createProductStep({ title: "B" })
-)
-
-// Both execute in parallel, results are tupled
-```
-
-### **9. Transform Utility** (`transform.ts`)
-
-Data manipulation between steps:
-
-```typescript
-const transformedData = transform({ product, price }, (data) => ({
-  ...data.product,
-  finalPrice: data.price * 1.1
-}))
-
-// Required because composer function can't manipulate data directly
-```
-
-### **10. Hooks** (`create-hook.ts`)
-
-Extension points for workflows:
-
-```typescript
-const workflow = createWorkflow("my-workflow", (input) => {
-  const hook = createHook("afterProduct", () => {
-    // Extension point
-  })
-
-  const product = createProductStep(input)
-  hook.invoke(product)  // Trigger hook
-
-  return new WorkflowResponse(product)
-})
-
-// External code can register handlers
-workflow.hooks.afterProduct((productData) => {
-  // Custom logic
-})
-```
-
-## Patterns
-
-### **1. Saga Pattern Implementation**
-
-```
-Step 1: Create Product ✓
-Step 2: Reserve Inventory ✓
-Step 3: Charge Payment ✗ (FAILS)
-
-Compensation Flow (Reverse):
-Step 2 Compensate: Release Inventory ✓
-Step 1 Compensate: Delete Product ✓
-```
-
-### **2. Idempotency**
-
-```typescript
-const transactionId = `create-product-${orderId}`
-
-// First call
-await workflow.run({
-  input,
-  transactionId  // Custom ID for idempotency
-})
-
-// Retry (same transactionId) - resumes from last successful step
-await workflow.run({
-  input,
-  transactionId
-})
-```
-
-### **3. Nested Workflows**
-
-```typescript
-const childWorkflow = createWorkflow("child", (input) => {
-  return new WorkflowResponse(doSomething(input))
-})
-
-const parentWorkflow = createWorkflow("parent", (input) => {
-  const result = childWorkflow.runAsStep({ input })
-  return new WorkflowResponse(result)
-})
-
-// Nested compensation automatically handled
-```
-
-### **4. Conditional Steps**
-
-```typescript
-const step = createProductStep(input).if(
-  input,
-  (data) => data.shouldCreate
-)
-
-// Step only executes if condition returns true
-```
-
-### **5. Async Steps**
-
-```typescript
-const asyncStep = createStep(
-  { name: "send-email", async: true },
-  async (input) => {
-    // Queued for background execution
-    return new StepResponse({ emailId: "..." })
-  }
-)
-
-// Workflow continues, step executes asynchronously
-```
-
-## .NET Mapping with MassTransit Sagas
-
-### 1. Replace Workflow with MassTransit State Machine
-
-**Medusa Workflow:**
-```typescript
-const createProductWorkflow = createWorkflow("create-product", (input) => {
-  const product = createProductStep(input)
-  const inventory = reserveInventoryStep(product.id)
-  return new WorkflowResponse({ product, inventory })
-})
-```
-
-**.NET MassTransit Saga:**
-```csharp
-public class CreateProductSaga : MassTransitStateMachine<CreateProductState>
-{
-    public CreateProductSaga()
-    {
-        InstanceState(x => x.CurrentState);
-
-        Event(() => CreateProductRequested, x => x.CorrelateById(m => m.Message.OrderId));
-
-        Initially(
-            When(CreateProductRequested)
-                .Then(context => {
-                    context.Instance.ProductData = context.Data;
-                })
-                .PublishAsync(context => context.Init<CreateProduct>(new
-                {
-                    context.Instance.ProductData
-                }))
-                .TransitionTo(CreatingProduct)
-        );
-
-        During(CreatingProduct,
-            When(ProductCreated)
-                .PublishAsync(context => context.Init<ReserveInventory>(new
-                {
-                    ProductId = context.Data.ProductId
-                }))
-                .TransitionTo(ReservingInventory),
-
-            When(ProductCreationFailed)
-                .TransitionTo(Failed)
-        );
-
-        During(ReservingInventory,
-            When(InventoryReserved)
-                .TransitionTo(Completed),
-
-            When(InventoryReservationFailed)
-                .PublishAsync(context => context.Init<DeleteProduct>(new
-                {
-                    context.Instance.ProductId
-                }))
-                .TransitionTo(CompensatingProduct)
-        );
-    }
-
-    public State CreatingProduct { get; private set; }
-    public State ReservingInventory { get; private set; }
-    public State CompensatingProduct { get; private set; }
-    public State Completed { get; private set; }
-    public State Failed { get; private set; }
-
-    public Event<CreateProductRequest> CreateProductRequested { get; private set; }
-    public Event<ProductCreatedEvent> ProductCreated { get; private set; }
-    public Event<InventoryReservedEvent> InventoryReserved { get; private set; }
-}
-
-public class CreateProductState : SagaStateMachineInstance
-{
-    public Guid CorrelationId { get; set; }
-    public string CurrentState { get; set; }
-    public ProductData ProductData { get; set; }
-    public string ProductId { get; set; }
-}
-```
-
-### 2. Step Pattern with Consumers
-
-**Medusa Step:**
+- Step-based execution (sequential/parallel)
+- Automatic compensation (Saga pattern)
+- Idempotency via transaction IDs
+- Async execution with workflow engine
+- Type-safe composition
+
+**2. Step**
+Atomic unit of work with invoke + compensate:
 ```typescript
 const createProductStep = createStep(
   "create-product",
@@ -480,200 +30,571 @@ const createProductStep = createStep(
 )
 ```
 
-**.NET Consumer with Compensation:**
-```csharp
-public class CreateProductConsumer : IConsumer<CreateProduct>
-{
-    private readonly IProductService _productService;
+**3. Workflow Composition**
+```typescript
+const createProductWorkflow = createWorkflow(
+  "create-product",
+  (input) => {
+    const product = createProductStep(input)
+    const inventory = reserveInventoryStep(product.id)
+    return new WorkflowResponse({ product, inventory })
+  }
+)
+```
 
-    public async Task Consume(ConsumeContext<CreateProduct> context)
+## FastEndpoints Mapping Strategy
+
+FastEndpoints doesn't have a direct "workflow engine" but provides **primitives to build equivalent functionality**:
+
+1. **Command Bus** → Synchronous steps
+2. **Job Queues** → Asynchronous steps with persistence
+3. **Event Bus** → Compensation triggers and cross-cutting concerns
+
+### Pattern 1: Simple Workflows = Command Chains
+
+For **synchronous, short-lived workflows**, use Command Bus:
+
+```csharp
+// Medusa Workflow
+const workflow = createWorkflow("create-product", (input) => {
+  const product = createProductStep(input)
+  const indexed = indexProductStep(product)
+  return new WorkflowResponse(indexed)
+})
+
+// FastEndpoints Equivalent
+public class CreateProductCommand : ICommand<Product>
+{
+    public string Title { get; set; }
+    public decimal Price { get; set; }
+}
+
+public class CreateProductHandler : ICommandHandler<CreateProductCommand, Product>
+{
+    public async Task<Product> ExecuteAsync(
+        CreateProductCommand cmd,
+        CancellationToken ct)
+    {
+        // Step 1: Create product
+        var product = await _productService.CreateAsync(new Product
+        {
+            Title = cmd.Title,
+            Price = cmd.Price
+        }, ct);
+
+        // Step 2: Index product (via event - decoupled)
+        await new ProductCreatedEvent
+        {
+            ProductId = product.Id
+        }.PublishAsync(Mode.WaitForNone, ct);
+
+        return product;
+    }
+}
+
+// Event handler for indexing (automatic, decoupled)
+public class IndexProductHandler : IEventHandler<ProductCreatedEvent>
+{
+    public async Task HandleAsync(ProductCreatedEvent evt, CancellationToken ct)
+    {
+        await _searchService.IndexAsync(evt.ProductId, ct);
+    }
+}
+```
+
+**Key Points:**
+- No explicit workflow definition needed
+- Command handler executes steps sequentially
+- Events decouple side effects (indexing, notifications)
+- No compensation for simple cases (let DB transactions handle it)
+
+### Pattern 2: Saga Workflows = Job Queues + Events
+
+For **long-running, distributed workflows** with compensation:
+
+```csharp
+// Medusa Workflow (multi-step with compensation)
+const createOrderWorkflow = createWorkflow("create-order", (input) => {
+  const order = createOrderStep(input)
+  const inventory = reserveInventoryStep(order) // Can fail
+  const payment = chargePaymentStep(order)      // Can fail
+  return new WorkflowResponse({ order, inventory, payment })
+})
+
+// FastEndpoints Equivalent with Saga Pattern
+```
+
+#### Step 1: Orchestrator Command
+
+```csharp
+public class CreateOrderCommand : ICommand<OrderResult>
+{
+    public string CustomerId { get; set; }
+    public List<OrderItem> Items { get; set; }
+    public decimal Total { get; set; }
+}
+
+public class CreateOrderHandler : ICommandHandler<CreateOrderCommand, OrderResult>
+{
+    public async Task<OrderResult> ExecuteAsync(
+        CreateOrderCommand cmd,
+        CancellationToken ct)
+    {
+        var sagaId = Guid.NewGuid().ToString();
+
+        // Step 1: Create order (synchronous)
+        var order = await _orderService.CreateAsync(new Order
+        {
+            CustomerId = cmd.CustomerId,
+            Items = cmd.Items,
+            Total = cmd.Total,
+            Status = OrderStatus.Pending,
+            SagaId = sagaId
+        }, ct);
+
+        // Step 2: Queue inventory reservation (async, can fail)
+        await new ReserveInventoryJob
+        {
+            SagaId = sagaId,
+            OrderId = order.Id,
+            Items = cmd.Items
+        }.QueueJobAsync(ct);
+
+        // Don't wait - return immediately
+        return new OrderResult
+        {
+            OrderId = order.Id,
+            Status = "Processing",
+            SagaId = sagaId
+        };
+    }
+}
+```
+
+#### Step 2: Job Handlers with Failure Events
+
+```csharp
+// Job 1: Reserve Inventory
+public class ReserveInventoryJob : ICommand
+{
+    public string SagaId { get; set; }
+    public string OrderId { get; set; }
+    public List<OrderItem> Items { get; set; }
+}
+
+public class ReserveInventoryJobHandler : ICommandHandler<ReserveInventoryJob>
+{
+    public async Task ExecuteAsync(ReserveInventoryJob job, CancellationToken ct)
     {
         try
         {
-            var product = await _productService.Create(context.Message);
+            // Reserve inventory
+            await _inventoryService.ReserveAsync(job.Items, ct);
 
-            await context.Publish(new ProductCreated
+            // Success - queue next job (payment)
+            await new ChargePaymentJob
             {
-                ProductId = product.Id,
-                Product = product
-            });
+                SagaId = job.SagaId,
+                OrderId = job.OrderId,
+                Amount = job.Items.Sum(i => i.Price * i.Quantity)
+            }.QueueJobAsync(ct);
         }
         catch (Exception ex)
         {
-            await context.Publish(new ProductCreationFailed
+            // Failure - trigger compensation
+            await new SagaFailedEvent
             {
+                SagaId = job.SagaId,
+                OrderId = job.OrderId,
+                FailedStep = "ReserveInventory",
                 Reason = ex.Message
-            });
+            }.PublishAsync(ct);
+
+            throw; // Re-throw to mark job as failed
         }
     }
 }
 
-// Compensation consumer
-public class DeleteProductConsumer : IConsumer<DeleteProduct>
+// Job 2: Charge Payment
+public class ChargePaymentJob : ICommand
 {
-    private readonly IProductService _productService;
-
-    public async Task Consume(ConsumeContext<DeleteProduct> context)
-    {
-        await _productService.Delete(context.Message.ProductId);
-    }
-}
-```
-
-### 3. Workflow Execution
-
-**Medusa:**
-```typescript
-const { result } = await workflow(container).run({ input })
-```
-
-**.NET:**
-```csharp
-// Via message bus
-await _publishEndpoint.Publish(new CreateProductRequest
-{
-    OrderId = orderId,
-    Title = "Shirt"
-});
-
-// Check status
-var saga = await _repository.GetSaga(orderId);
-```
-
-### 4. Alternative: Simpler Workflow Library (Elsa/Workflow Core)
-
-If saga pattern too complex, use .NET workflow library:
-
-```csharp
-public class CreateProductWorkflow : IWorkflow<ProductInput, ProductOutput>
-{
-    public string Id => "create-product-workflow";
-
-    public void Build(IWorkflowBuilder<ProductInput, ProductOutput> builder)
-    {
-        builder
-            .StartWith<CreateProductStep>()
-                .Input(step => step.Input, data => data)
-                .Output(data => data.ProductId, step => step.Output.ProductId)
-                .CompensateWith<DeleteProductStep>()
-            .Then<ReserveInventoryStep>()
-                .Input(step => step.ProductId, data => data.ProductId)
-                .CompensateWith<ReleaseInventoryStep>()
-            .Then<SendEmailStep>();
-    }
+    public string SagaId { get; set; }
+    public string OrderId { get; set; }
+    public decimal Amount { get; set; }
 }
 
-// Steps
-public class CreateProductStep : StepBody
+public class ChargePaymentJobHandler : ICommandHandler<ChargePaymentJob>
 {
-    public ProductInput Input { get; set; }
-    public ProductOutput Output { get; set; }
-
-    public override async Task<ExecutionResult> RunAsync(IStepExecutionContext context)
+    public async Task ExecuteAsync(ChargePaymentJob job, CancellationToken ct)
     {
-        var productService = context.GetService<IProductService>();
-        var product = await productService.Create(Input);
-
-        Output = new ProductOutput { ProductId = product.Id };
-
-        return ExecutionResult.Next();
-    }
-}
-
-public class DeleteProductStep : StepBody
-{
-    public string ProductId { get; set; }
-
-    public override async Task<ExecutionResult> RunAsync(IStepExecutionContext context)
-    {
-        var productService = context.GetService<IProductService>();
-        await productService.Delete(ProductId);
-
-        return ExecutionResult.Next();
-    }
-}
-
-// Execute
-var workflowHost = serviceProvider.GetRequiredService<IWorkflowHost>();
-await workflowHost.StartWorkflow("create-product-workflow", new ProductInput
-{
-    Title = "Shirt"
-});
-```
-
-### 5. Idempotency
-
-**Medusa:** Built-in via transactionId
-**.NET:** Use MassTransit RequestId or Inbox pattern
-
-```csharp
-public class CreateProductConsumer : IConsumer<CreateProduct>
-{
-    private readonly IProductService _productService;
-    private readonly IIdempotencyStore _idempotencyStore;
-
-    public async Task Consume(ConsumeContext<CreateProduct> context)
-    {
-        var requestId = context.RequestId ?? context.MessageId;
-
-        if (await _idempotencyStore.Exists(requestId))
+        try
         {
-            // Already processed
-            return;
+            await _paymentService.ChargeAsync(job.OrderId, job.Amount, ct);
+
+            // Success - saga complete
+            await new SagaCompletedEvent
+            {
+                SagaId = job.SagaId,
+                OrderId = job.OrderId
+            }.PublishAsync(ct);
         }
+        catch (Exception ex)
+        {
+            // Failure - trigger compensation
+            await new SagaFailedEvent
+            {
+                SagaId = job.SagaId,
+                OrderId = job.OrderId,
+                FailedStep = "ChargePayment",
+                Reason = ex.Message
+            }.PublishAsync(ct);
 
-        var product = await _productService.Create(context.Message);
-        await _idempotencyStore.Store(requestId, product);
-
-        await context.Publish(new ProductCreated { Product = product });
+            throw;
+        }
     }
 }
 ```
 
-## Key Differences
+#### Step 3: Compensation Event Handlers
 
-| Aspect | MedusaJS | .NET (MassTransit) | .NET (Workflow Core) |
-|--------|----------|-------------------|---------------------|
-| Pattern | Saga (coded) | Saga (state machine) | Workflow (coded) |
-| Compensation | Auto-reverse | Manual state transitions | Compensate blocks |
-| State Storage | Transaction store | Saga repository | Workflow persistence |
-| Execution | In-process or async | Message-based | In-process |
-| Type Safety | Full TypeScript | Message contracts | Step DTOs |
-| Composition | Functional | Declarative | Fluent builder |
+```csharp
+// Compensation Handler
+public class SagaCompensationHandler : IEventHandler<SagaFailedEvent>
+{
+    public async Task HandleAsync(SagaFailedEvent evt, CancellationToken ct)
+    {
+        _logger.LogWarning(
+            "Saga {SagaId} failed at step {Step}. Compensating...",
+            evt.SagaId,
+            evt.FailedStep);
+
+        // Get saga state
+        var order = await _orderService.GetBySagaIdAsync(evt.SagaId, ct);
+
+        // Compensate based on which step failed
+        switch (evt.FailedStep)
+        {
+            case "ReserveInventory":
+                // Nothing to compensate yet
+                await _orderService.CancelAsync(order.Id, ct);
+                break;
+
+            case "ChargePayment":
+                // Need to release inventory
+                await _inventoryService.ReleaseAsync(order.Id, ct);
+                await _orderService.CancelAsync(order.Id, ct);
+                break;
+        }
+
+        // Notify customer
+        await new OrderCancelledEvent
+        {
+            OrderId = order.Id,
+            Reason = evt.Reason
+        }.PublishAsync(ct);
+    }
+}
+
+// Success Handler
+public class SagaCompletionHandler : IEventHandler<SagaCompletedEvent>
+{
+    public async Task HandleAsync(SagaCompletedEvent evt, CancellationToken ct)
+    {
+        // Mark order as complete
+        await _orderService.CompleteAsync(evt.OrderId, ct);
+
+        // Send confirmation email
+        await new OrderConfirmedEvent
+        {
+            OrderId = evt.OrderId
+        }.PublishAsync(ct);
+    }
+}
+```
+
+### Pattern 3: Explicit Saga State Machine
+
+For **complex sagas with many states**, track saga state explicitly:
+
+```csharp
+// Saga State Entity
+public class OrderSaga
+{
+    public string SagaId { get; set; }
+    public string OrderId { get; set; }
+    public SagaStatus Status { get; set; }
+    public string CurrentStep { get; set; }
+    public Dictionary<string, bool> CompletedSteps { get; set; } = new();
+    public DateTime CreatedAt { get; set; }
+    public DateTime? CompletedAt { get; set; }
+}
+
+public enum SagaStatus
+{
+    Started,
+    ReservingInventory,
+    InventoryReserved,
+    ChargingPayment,
+    Completed,
+    Failed,
+    Compensating,
+    Compensated
+}
+
+// Saga Coordinator (injected into job handlers)
+public class SagaCoordinator
+{
+    public async Task UpdateSagaStateAsync(
+        string sagaId,
+        SagaStatus status,
+        string step,
+        CancellationToken ct)
+    {
+        var saga = await _db.Sagas.FindAsync(sagaId, ct);
+        saga.Status = status;
+        saga.CurrentStep = step;
+        saga.CompletedSteps[step] = true;
+        await _db.SaveChangesAsync(ct);
+    }
+
+    public async Task<List<string>> GetCompletedStepsAsync(
+        string sagaId,
+        CancellationToken ct)
+    {
+        var saga = await _db.Sagas.FindAsync(sagaId, ct);
+        return saga.CompletedSteps.Where(kvp => kvp.Value)
+                                   .Select(kvp => kvp.Key)
+                                   .ToList();
+    }
+}
+
+// Updated job handler with state tracking
+public class ReserveInventoryJobHandler : ICommandHandler<ReserveInventoryJob>
+{
+    private readonly SagaCoordinator _sagaCoordinator;
+
+    public async Task ExecuteAsync(ReserveInventoryJob job, CancellationToken ct)
+    {
+        await _sagaCoordinator.UpdateSagaStateAsync(
+            job.SagaId,
+            SagaStatus.ReservingInventory,
+            "ReserveInventory",
+            ct);
+
+        try
+        {
+            await _inventoryService.ReserveAsync(job.Items, ct);
+
+            await _sagaCoordinator.UpdateSagaStateAsync(
+                job.SagaId,
+                SagaStatus.InventoryReserved,
+                "ReserveInventory",
+                ct);
+
+            // Queue next step
+            await new ChargePaymentJob { ... }.QueueJobAsync(ct);
+        }
+        catch (Exception ex)
+        {
+            await _sagaCoordinator.UpdateSagaStateAsync(
+                job.SagaId,
+                SagaStatus.Failed,
+                "ReserveInventory",
+                ct);
+
+            await new SagaFailedEvent { ... }.PublishAsync(ct);
+            throw;
+        }
+    }
+}
+
+// Compensation with state awareness
+public class SagaCompensationHandler : IEventHandler<SagaFailedEvent>
+{
+    public async Task HandleAsync(SagaFailedEvent evt, CancellationToken ct)
+    {
+        var completedSteps = await _sagaCoordinator
+            .GetCompletedStepsAsync(evt.SagaId, ct);
+
+        // Compensate in reverse order
+        if (completedSteps.Contains("ChargePayment"))
+            await _paymentService.RefundAsync(evt.OrderId, ct);
+
+        if (completedSteps.Contains("ReserveInventory"))
+            await _inventoryService.ReleaseAsync(evt.OrderId, ct);
+
+        await _orderService.CancelAsync(evt.OrderId, ct);
+
+        await _sagaCoordinator.UpdateSagaStateAsync(
+            evt.SagaId,
+            SagaStatus.Compensated,
+            "Compensation",
+            ct);
+    }
+}
+```
+
+## Job Queue Setup with EF Core
+
+### 1. Job Record Entity
+
+```csharp
+public class JobRecord : IJobStorageRecord
+{
+    public Guid ID { get; set; }
+    public DateTime ExecuteAfter { get; set; }
+    public DateTime ExpireOn { get; set; }
+    public bool IsComplete { get; set; }
+    public string QueueID { get; set; }
+    public byte[] CommandBytes { get; set; }
+    public string CommandTypeName { get; set; }
+    public Guid TrackingID { get; set; }
+}
+```
+
+### 2. DbContext Configuration
+
+```csharp
+public class MedusaDbContext : DbContext
+{
+    public DbSet<JobRecord> JobRecords { get; set; }
+    public DbSet<OrderSaga> Sagas { get; set; }
+
+    protected override void OnModelCreating(ModelBuilder builder)
+    {
+        builder.Entity<JobRecord>(e =>
+        {
+            e.HasKey(j => j.ID);
+            e.HasIndex(j => new { j.QueueID, j.ExecuteAfter, j.IsComplete });
+            e.HasIndex(j => j.ExpireOn);
+        });
+
+        builder.Entity<OrderSaga>(e =>
+        {
+            e.HasKey(s => s.SagaId);
+            e.Property(s => s.CompletedSteps).HasColumnType("jsonb");
+        });
+    }
+}
+```
+
+### 3. Job Storage Provider
+
+```csharp
+public class EfCoreJobStorageProvider : IJobStorageProvider<JobRecord>
+{
+    private readonly IDbContextFactory<MedusaDbContext> _factory;
+
+    public EfCoreJobStorageProvider(IDbContextFactory<MedusaDbContext> factory)
+    {
+        _factory = factory;
+    }
+
+    public async Task StoreJobAsync(JobRecord job, CancellationToken ct)
+    {
+        await using var db = await _factory.CreateDbContextAsync(ct);
+        await db.JobRecords.AddAsync(job, ct);
+        await db.SaveChangesAsync(ct);
+    }
+
+    public async Task<IEnumerable<JobRecord>> GetNextBatchAsync(
+        PendingSearchParams<JobRecord> p)
+    {
+        await using var db = await _factory.CreateDbContextAsync(p.CancellationToken);
+        return await db.JobRecords
+            .Where(p.Match)
+            .OrderBy(j => j.ExecuteAfter)
+            .Take(p.Limit)
+            .ToListAsync(p.CancellationToken);
+    }
+
+    public async Task MarkJobAsCompleteAsync(JobRecord job, CancellationToken ct)
+    {
+        await using var db = await _factory.CreateDbContextAsync(ct);
+        job.IsComplete = true;
+        db.JobRecords.Update(job);
+        await db.SaveChangesAsync(ct);
+    }
+
+    public async Task OnHandlerExecutionFailureAsync(
+        JobRecord job,
+        Exception ex,
+        CancellationToken ct)
+    {
+        await using var db = await _factory.CreateDbContextAsync(ct);
+
+        // Retry after 1 minute
+        job.ExecuteAfter = DateTime.UtcNow.AddMinutes(1);
+        db.JobRecords.Update(job);
+        await db.SaveChangesAsync(ct);
+    }
+
+    public async Task PurgeStaleJobsAsync(
+        StaleJobSearchParams<JobRecord> p)
+    {
+        await using var db = await _factory.CreateDbContextAsync(p.CancellationToken);
+        var staleJobs = db.JobRecords.Where(p.Match);
+        db.JobRecords.RemoveRange(staleJobs);
+        await db.SaveChangesAsync(p.CancellationToken);
+    }
+}
+```
+
+## Comparison Table
+
+| Aspect | MedusaJS Workflows | FastEndpoints |
+|--------|-------------------|---------------|
+| **Simple Workflows** | Workflow + Steps | Command handlers |
+| **Long-Running** | Workflow Engine + Redis | Job Queues + EF Core/Redis |
+| **Compensation** | Automatic (reverse order) | Manual (event-driven) |
+| **State Tracking** | Built-in transaction store | Custom saga state table |
+| **Idempotency** | Transaction ID | Job Tracking ID |
+| **Parallelization** | `parallelize()` helper | Multiple job queues |
+| **Nested Workflows** | `runAsStep()` | Nested commands/jobs |
+| **Type Safety** | TypeScript inference | C# strong typing |
 
 ## Implementation Recommendations
 
-### NuGet Packages
+### For Simple Workflows:
+✅ Use **Command Bus** only
+- Fast, in-process
+- No persistence overhead
+- Perfect for < 5 second operations
 
-**Option 1: MassTransit (Enterprise-grade sagas)**
-- **MassTransit**
-- **MassTransit.RabbitMQ** or **MassTransit.AzureServiceBus**
-- **MassTransit.EntityFrameworkCore** - State persistence
+### For Complex Sagas:
+✅ Use **Job Queues + Events + Saga State**
+- Persistent, resilient
+- Explicit compensation
+- Good observability
 
-**Option 2: WorkflowCore (Simpler workflows)**
-- **WorkflowCore**
-- **WorkflowCore.Persistence.EntityFramework**
+### For Distributed Systems:
+✅ Use **Job Queues + Redis Pub/Sub**
+- Scale across multiple instances
+- Reliable message delivery
+- External event integration
 
-**Option 3: Elsa Workflows (Complex BPM)**
-- **Elsa**
-- **Elsa.Persistence.EntityFrameworkCore**
+## Example: Complete Create Order Saga
 
-### Recommendation
+See full example in: `ARCHITECTURE_OVERVIEW.md` section "Implementing Saga Pattern with FastEndpoints"
 
-For Medusa-like workflows with compensation:
-→ **Use MassTransit Sagas** for distributed, event-driven sagas
-→ **Use WorkflowCore** for in-process workflows with simpler compensation
+## Key Takeaways
+
+1. **No need for MassTransit/Hangfire** - FastEndpoints provides all primitives
+2. **Sagas are explicit** - You control the compensation logic
+3. **State tracking is manual** - But simple with a saga state table
+4. **Job queues provide durability** - Failed steps can be retried
+5. **Events provide decoupling** - Compensation and cross-cutting concerns
+6. **Commands provide synchronicity** - Fast paths don't need jobs
 
 ## References
 
-**Core Files:**
-- `workflows-sdk/src/utils/composer/create-workflow.ts` - Workflow definition
-- `workflows-sdk/src/utils/composer/create-step.ts` - Step definition
-- `orchestration/src/transaction/transaction-orchestrator.ts` - Orchestration
-- `orchestration/src/transaction/distributed-transaction.ts` - State tracking
-- `orchestration/src/workflow/workflow-manager.ts` - Workflow registry
-- `modules/workflow-engine-*/src/services/workflow-engine.ts` - Async execution
+**FastEndpoints Docs:**
+- https://fast-endpoints.com/docs/command-bus
+- https://fast-endpoints.com/docs/event-bus
+- https://fast-endpoints.com/docs/job-queues
+- https://github.com/FastEndpoints/Job-Queue-EF-Core-Demo
 
-**Example Workflows:**
-- `core-flows/src/product/workflows/create-product.ts`
-- `core-flows/src/order/workflows/create-order.ts`
+**MedusaJS Workflow Files:**
+- `workflows-sdk/src/utils/composer/create-workflow.ts`
+- `workflows-sdk/src/utils/composer/create-step.ts`
+- `orchestration/src/transaction/transaction-orchestrator.ts`

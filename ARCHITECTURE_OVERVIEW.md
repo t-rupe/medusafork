@@ -1,169 +1,69 @@
-# MedusaJS Architecture Overview - .NET Mapping Guide
+# MedusaJS Architecture Overview - .NET Mapping with FastEndpoints
 
 ## Purpose
 
-This document provides a comprehensive architectural overview of MedusaJS framework and how to map its concepts to .NET 10 with FastEndpoints using VSA/REPR patterns.
+This document provides a comprehensive architectural overview of MedusaJS framework and how to map its concepts to .NET 10 with **FastEndpoints native features only** - no commercial 3rd-party dependencies.
+
+## FastEndpoints Native Capabilities
+
+FastEndpoints provides everything needed to replicate MedusaJS functionality:
+
+1. **Job Queues** - Background job processing with Redis/EF Core/MongoDB persistence
+2. **Event Bus** - In-process pub/sub pattern for decoupled event handling
+3. **Command Bus** - In-process command execution with single handlers
+4. **Endpoints** - REPR pattern for API routes
+5. **Validation** - Built-in FluentValidation integration
+6. **Testing** - Integrated testing framework
+
+**NO NEED FOR:** MassTransit, Hangfire, Quartz.NET, MediatR, or other commercial libraries.
 
 ## System Architecture
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
-│                        HTTP Layer (Express)                       │
+│                    FastEndpoints HTTP Layer                       │
 │  ┌────────────┐  ┌────────────┐  ┌──────────────┐               │
-│  │ File-based │→ │ Middleware │→ │  Auth (JWT/  │               │
-│  │  Routing   │  │  Pipeline  │  │  Session/API)│               │
+│  │  Endpoint  │→ │ Validation │→ │ Auth/Policies │               │
+│  │   REPR     │  │  Pipeline  │  │   Pipeline    │               │
 │  └────────────┘  └────────────┘  └──────────────┘               │
 └─────────────────────────┬────────────────────────────────────────┘
                           ↓
 ┌──────────────────────────────────────────────────────────────────┐
-│                    DI Container (Awilix)                          │
+│                   Built-in DI Container                           │
 │  ┌──────────┐  ┌──────────┐  ┌───────────┐  ┌──────────┐       │
-│  │ Services │  │ Repositor│  │  Modules  │  │  Config  │       │
-│  │ Registry │  │   ies    │  │  Loader   │  │  Logger  │       │
+│  │ Services │  │ Repositor│  │  Command  │  │   Job    │       │
+│  │ Registry │  │   ies    │  │  Handlers │  │  Queues  │       │
 │  └──────────┘  └──────────┘  └───────────┘  └──────────┘       │
 └─────────────────────────┬────────────────────────────────────────┘
                           ↓
 ┌──────────────────────────────────────────────────────────────────┐
-│                     Workflow Engine (Orchestration)               │
+│              FastEndpoints Event Bus + Command Bus                │
 │  ┌───────────┐  ┌────────────┐  ┌──────────────┐               │
-│  │  Workflow │  │    Steps   │  │ Compensation │               │
-│  │  Composer │→ │  Execution │→ │   (Saga)     │               │
+│  │  Commands │  │   Events   │  │   Job Queue  │               │
+│  │  (sync)   │→ │  (pub/sub) │→ │   (async)    │               │
 │  └───────────┘  └────────────┘  └──────────────┘               │
 └─────────────────────────┬────────────────────────────────────────┘
                           ↓
 ┌──────────────────────────────────────────────────────────────────┐
-│                  Module System (Domain Modules)                   │
-│  ┌────────┐  ┌────────┐  ┌────────┐  ┌────────┐  ┌────────┐   │
-│  │Product │  │ Cart   │  │ Order  │  │Payment │  │Inventory│   │
-│  │ Module │  │ Module │  │ Module │  │ Module │  │ Module  │   │
-│  └────────┘  └────────┘  └────────┘  └────────┘  └────────┘   │
+│              Domain Modules (VSA Features)                        │
+│  ┌────────┐  ┌────────┐  ┌────────┐  ┌────────┐                │
+│  │Product │  │ Cart   │  │ Order  │  │Payment │                │
+│  │Feature │  │Feature │  │Feature │  │Feature │                │
+│  └────────┘  └────────┘  └────────┘  └────────┘                │
 └─────────────────────────┬────────────────────────────────────────┘
                           ↓
 ┌──────────────────────────────────────────────────────────────────┐
-│              Database Layer (MikroORM + PostgreSQL)               │
+│              Database Layer (EF Core + PostgreSQL)                │
 │  ┌──────────┐  ┌────────────┐  ┌──────────────┐                │
-│  │   DML    │  │  Reposit   │  │  Migrations  │                │
-│  │  Entities│→ │  ories     │→ │  & Indexes   │                │
+│  │ Entities │  │  DbContext │  │  Repositories│                │
+│  │  Config  │→ │  Migrations│→ │   Pattern    │                │
 │  └──────────┘  └────────────┘  └──────────────┘                │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
-## Core Components
-
-### 1. HTTP Layer
-**Purpose:** API endpoint routing, authentication, validation, request/response handling
-
-**MedusaJS:**
-- Express-based with file-based routing (`/api/admin/products/route.ts`)
-- Middleware pipeline (auth, CORS, validation, error handling)
-- Route discovery and registration
-- Typed request/response objects
-
-**→ .NET Mapping:**
-- **FastEndpoints** for endpoint definition
-- **ASP.NET Core middleware** pipeline
-- **FluentValidation** for request validation
-- **JWT/Cookie authentication**
-
-**See:** `packages/core/framework/src/http/ANALYSIS.md`
-
-### 2. Dependency Injection
-**Purpose:** Service registration, scoping, module loading
-
-**MedusaJS:**
-- Awilix container with string-based registration
-- Auto-registration of repositories and services
-- Request scoping via `container.createScope()`
-- Collection registration with `registerAdd`
-
-**→ .NET Mapping:**
-- **Built-in ASP.NET Core DI**
-- **Scrutor** for assembly scanning
-- Automatic per-request scoping
-- `IEnumerable<T>` for collections
-
-**See:** `packages/core/framework/src/CONTAINER_ANALYSIS.md`
-
-### 3. Database Layer
-**Purpose:** Data access, entity management, migrations, transactions
-
-**MedusaJS:**
-- Custom DML (Data Modeling Language) for entity definition
-- MikroORM for PostgreSQL
-- Repository pattern with generic base
-- Soft deletes, upserts, relation management
-
-**→ .NET Mapping:**
-- **Entity Framework Core**
-- **Fluent API** for entity configuration
-- **Generic repository** pattern
-- **Query filters** for soft deletes
-
-**See:** `packages/core/utils/src/dal/ANALYSIS.md`
-
-### 4. Workflow Engine
-**Purpose:** Distributed transactions, saga pattern, compensation logic
-
-**MedusaJS:**
-- Workflow = composition of steps
-- Step = invoke + compensate functions
-- Transaction orchestrator manages execution
-- Automatic rollback on failures
-- Async/background execution support
-
-**→ .NET Mapping:**
-- **MassTransit Sagas** (distributed)
-- **WorkflowCore** (in-process)
-- **Outbox pattern** for reliability
-- **State machine** for compensation
-
-**See:** `packages/core/workflows-sdk/src/WORKFLOWS_ANALYSIS.md`
-
-### 5. Module System
-**Purpose:** Domain-driven modular architecture
-
-**MedusaJS:**
-- Self-contained domain modules (Product, Cart, Order, etc.)
-- Each module has: entities, repositories, services, workflows
-- Module loader auto-registers components
-- Inter-module communication via Links
-
-**→ .NET Mapping:**
-- **Vertical Slice Architecture** (VSA)
-- **Feature folders** per domain
-- **Module extension methods** for DI
-- **MediatR** for cross-module communication
-
-### 6. Event System
-**Purpose:** Asynchronous event handling, pub/sub
-
-**MedusaJS:**
-- Event bus module (Redis or Local)
-- Subscribers auto-registered
-- Event emission from workflows
-- Typed event payloads
-
-**→ .NET Mapping:**
-- **MassTransit** message bus
-- **MediatR** notifications (in-process)
-- **RabbitMQ/Azure Service Bus** (distributed)
-
-### 7. Jobs & Scheduling
-**Purpose:** Background job processing, scheduled tasks
-
-**MedusaJS:**
-- Job definitions with cron schedules
-- Workflow engine for async execution
-- Redis-backed queue
-
-**→ .NET Mapping:**
-- **Hangfire** for background jobs
-- **Quartz.NET** for scheduling
-- **MassTransit** scheduling
-
 ## Request Flow Example
 
-### MedusaJS: Create Product
+### MedusaJS: Create Product Workflow
 
 ```
 1. HTTP Request
@@ -176,31 +76,27 @@ This document provides a comprehensive architectural overview of MedusaJS framew
    → Route handler: POST /admin/products
 
 3. Route Handler
-   → Resolve container scope
    → Execute createProductWorkflow
 
 4. Workflow Execution
    Step 1: createProductStep
      → Invoke: productService.create(input)
-     → Store result + compensation data
    Step 2: indexProductStep
      → Invoke: indexService.index(product)
-     → Store result
    Step 3: emitProductCreatedEvent
      → Invoke: eventBus.emit("product.created")
 
    If Step 2 fails:
-     → Execute Step 1 compensation
-     → productService.delete(product.id)
+     → Compensation: productService.delete(product.id)
 
 5. Response
    { "product": { "id": "prod_123", "title": "Shirt" } }
 ```
 
-### .NET Equivalent
+### .NET with FastEndpoints: Create Product
 
 ```csharp
-// 1. FastEndpoints Endpoint
+// 1. Endpoint (REPR Pattern)
 public class CreateProductEndpoint : Endpoint<CreateProductRequest, ProductResponse>
 {
     public override void Configure()
@@ -213,202 +109,333 @@ public class CreateProductEndpoint : Endpoint<CreateProductRequest, ProductRespo
         CreateProductRequest req,
         CancellationToken ct)
     {
-        // 3. Execute workflow via MediatR or direct call
-        var command = new CreateProductCommand
+        // 3. Execute Command (replaces workflow)
+        var result = await new CreateProductCommand
         {
             Title = req.Title,
             Price = req.Price
-        };
-
-        var result = await SendAsync(command, ct);
+        }.ExecuteAsync(ct);
 
         // 5. Response
-        await SendAsync(new ProductResponse
+        await SendOkAsync(new ProductResponse
         {
             Product = result
-        }, cancellation: ct);
+        }, ct);
     }
 }
 
-// 4. Workflow (using WorkflowCore)
-public class CreateProductWorkflow : IWorkflow<CreateProductInput, Product>
-{
-    public void Build(IWorkflowBuilder<CreateProductInput, Product> builder)
-    {
-        builder
-            .StartWith<CreateProductStep>()
-                .CompensateWith<DeleteProductStep>()
-            .Then<IndexProductStep>()
-            .Then<EmitProductCreatedEventStep>();
-    }
-}
-
-// Steps
-public class CreateProductStep : StepBody
+// 4. Command Handler (replaces workflow step)
+public class CreateProductHandler : ICommandHandler<CreateProductCommand, Product>
 {
     private readonly IProductService _productService;
+    private readonly ILogger<CreateProductHandler> _logger;
 
-    public override async Task<ExecutionResult> RunAsync(IStepExecutionContext context)
+    public CreateProductHandler(
+        IProductService productService,
+        ILogger<CreateProductHandler> logger)
     {
-        var input = context.Workflow.Data;
-        var product = await _productService.Create(new Product
-        {
-            Title = input.Title,
-            Price = input.Price
-        });
+        _productService = productService;
+        _logger = logger;
+    }
 
-        context.Workflow.Data.Product = product;
-        return ExecutionResult.Next();
+    public async Task<Product> ExecuteAsync(
+        CreateProductCommand cmd,
+        CancellationToken ct)
+    {
+        try
+        {
+            // Create product
+            var product = await _productService.CreateAsync(new Product
+            {
+                Title = cmd.Title,
+                Price = cmd.Price
+            }, ct);
+
+            // Publish event (async handlers can index, send notifications, etc.)
+            await new ProductCreatedEvent
+            {
+                ProductId = product.Id,
+                Title = product.Title
+            }.PublishAsync(Mode.WaitForNone, ct);
+
+            return product;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to create product");
+            throw;
+        }
+    }
+}
+
+// Event Handler for indexing (decoupled)
+public class IndexProductHandler : IEventHandler<ProductCreatedEvent>
+{
+    private readonly ISearchIndexService _indexService;
+
+    public async Task HandleAsync(ProductCreatedEvent evt, CancellationToken ct)
+    {
+        await _indexService.IndexProductAsync(evt.ProductId, ct);
+    }
+}
+
+// Event Handler for notifications (decoupled)
+public class NotifyProductCreatedHandler : IEventHandler<ProductCreatedEvent>
+{
+    private readonly INotificationService _notificationService;
+
+    public async Task HandleAsync(ProductCreatedEvent evt, CancellationToken ct)
+    {
+        await _notificationService.SendAsync(
+            $"New product created: {evt.Title}",
+            ct);
     }
 }
 ```
 
-## .NET Project Structure
+## Implementing Saga Pattern with FastEndpoints
+
+For complex multi-step workflows with compensation (like MedusaJS workflows), use **Commands + Job Queues + Events**:
+
+### Pattern: Saga with Job Queue
+
+```csharp
+// 1. Main Command - Orchestrates the saga
+public class CreateOrderCommand : ICommand<OrderResult>
+{
+    public string CustomerId { get; set; }
+    public List<OrderItem> Items { get; set; }
+}
+
+public class CreateOrderHandler : ICommandHandler<CreateOrderCommand, OrderResult>
+{
+    public async Task<OrderResult> ExecuteAsync(
+        CreateOrderCommand cmd,
+        CancellationToken ct)
+    {
+        var sagaId = Guid.NewGuid();
+
+        // Step 1: Create order (synchronous)
+        var order = await _orderService.CreateAsync(cmd, ct);
+
+        // Step 2: Queue job for inventory reservation (async with compensation)
+        await new ReserveInventoryJob
+        {
+            SagaId = sagaId,
+            OrderId = order.Id,
+            Items = cmd.Items
+        }.QueueJobAsync(ct);
+
+        // Step 3: Queue job for payment (async with compensation)
+        await new ChargePaymentJob
+        {
+            SagaId = sagaId,
+            OrderId = order.Id,
+            Amount = order.Total
+        }.QueueJobAsync(ct);
+
+        return new OrderResult { OrderId = order.Id, Status = "Processing" };
+    }
+}
+
+// 2. Job Handler with Compensation
+public class ReserveInventoryJobHandler
+    : ICommandHandler<ReserveInventoryJob>
+{
+    public async Task ExecuteAsync(ReserveInventoryJob job, CancellationToken ct)
+    {
+        try
+        {
+            await _inventoryService.ReserveAsync(job.Items, ct);
+
+            // Publish success event
+            await new InventoryReservedEvent
+            {
+                SagaId = job.SagaId,
+                OrderId = job.OrderId
+            }.PublishAsync(ct);
+        }
+        catch (Exception ex)
+        {
+            // Publish failure event to trigger compensation
+            await new InventoryReservationFailedEvent
+            {
+                SagaId = job.SagaId,
+                OrderId = job.OrderId,
+                Reason = ex.Message
+            }.PublishAsync(ct);
+
+            throw;
+        }
+    }
+}
+
+// 3. Compensation Event Handler
+public class CompensateOrderHandler : IEventHandler<InventoryReservationFailedEvent>
+{
+    public async Task HandleAsync(
+        InventoryReservationFailedEvent evt,
+        CancellationToken ct)
+    {
+        // Cancel the order
+        await _orderService.CancelAsync(evt.OrderId, ct);
+
+        // Release any reserved resources
+        await _inventoryService.ReleaseAsync(evt.OrderId, ct);
+
+        // Notify customer
+        await new OrderCancelledEvent
+        {
+            OrderId = evt.OrderId,
+            Reason = evt.Reason
+        }.PublishAsync(ct);
+    }
+}
+```
+
+### Job Storage with EF Core
+
+```csharp
+// Job Record Entity
+public class JobRecord : IJobStorageRecord
+{
+    public Guid ID { get; set; }
+    public DateTime ExecuteAfter { get; set; }
+    public DateTime ExpireOn { get; set; }
+    public bool IsComplete { get; set; }
+    public string QueueID { get; set; }
+    public byte[] CommandBytes { get; set; }
+    public string CommandTypeName { get; set; }
+    public Guid TrackingID { get; set; }
+}
+
+// Job Storage Provider
+public class EfCoreJobStorageProvider
+    : IJobStorageProvider<JobRecord>
+{
+    private readonly MedusaDbContext _db;
+
+    public async Task StoreJobAsync(JobRecord job, CancellationToken ct)
+        => await _db.JobRecords.AddAsync(job, ct);
+
+    public async Task<IEnumerable<JobRecord>> GetNextBatchAsync(
+        PendingSearchParams<JobRecord> p)
+    {
+        return await _db.JobRecords
+            .Where(p.Match)
+            .OrderBy(j => j.ExecuteAfter)
+            .Take(p.Limit)
+            .ToListAsync(p.CancellationToken);
+    }
+
+    public async Task MarkJobAsCompleteAsync(JobRecord job, CancellationToken ct)
+    {
+        job.IsComplete = true;
+        await _db.SaveChangesAsync(ct);
+    }
+
+    public async Task PurgeStaleJobsAsync(
+        StaleJobSearchParams<JobRecord> p)
+    {
+        var staleJobs = _db.JobRecords.Where(p.Match);
+        _db.JobRecords.RemoveRange(staleJobs);
+        await _db.SaveChangesAsync(p.CancellationToken);
+    }
+}
+```
+
+## .NET Project Structure (VSA)
 
 ```
 Medusa.NET/
 ├── src/
 │   ├── Medusa.Core/
-│   │   ├── Domain/                   # Domain entities
-│   │   ├── Abstractions/             # Interfaces
-│   │   └── Common/                   # Shared utilities
+│   │   ├── Domain/
+│   │   │   ├── Product.cs
+│   │   │   ├── Order.cs
+│   │   │   └── Cart.cs
+│   │   ├── Common/
+│   │   │   ├── Result.cs
+│   │   │   └── Error.cs
+│   │   └── Abstractions/
+│   │       └── IRepository.cs
 │   │
 │   ├── Medusa.Infrastructure/
 │   │   ├── Data/
 │   │   │   ├── MedusaDbContext.cs
-│   │   │   ├── Repositories/
-│   │   │   └── Migrations/
-│   │   ├── Messaging/                # Event bus
-│   │   └── Jobs/                     # Background jobs
+│   │   │   ├── JobRecord.cs
+│   │   │   ├── EfCoreJobStorageProvider.cs
+│   │   │   └── Repositories/
+│   │   │       └── ProductRepository.cs
+│   │   └── Migrations/
 │   │
-│   ├── Medusa.Modules/
-│   │   ├── Product/
-│   │   │   ├── Entities/
-│   │   │   ├── Endpoints/            # FastEndpoints
-│   │   │   ├── Workflows/            # WorkflowCore workflows
-│   │   │   ├── Services/
-│   │   │   └── ProductModule.cs      # DI registration
+│   ├── Medusa.Features/  (VSA - Vertical Slices)
+│   │   ├── Products/
+│   │   │   ├── Create/
+│   │   │   │   ├── CreateProductEndpoint.cs
+│   │   │   │   ├── CreateProductCommand.cs
+│   │   │   │   ├── CreateProductHandler.cs
+│   │   │   │   ├── CreateProductValidator.cs
+│   │   │   │   └── ProductCreatedEvent.cs
+│   │   │   ├── Get/
+│   │   │   │   ├── GetProductEndpoint.cs
+│   │   │   │   └── GetProductQuery.cs
+│   │   │   ├── Update/
+│   │   │   └── Delete/
 │   │   │
-│   │   ├── Cart/
-│   │   ├── Order/
-│   │   └── Payment/
+│   │   ├── Orders/
+│   │   │   ├── Create/
+│   │   │   │   ├── CreateOrderEndpoint.cs
+│   │   │   │   ├── CreateOrderCommand.cs
+│   │   │   │   ├── ReserveInventoryJob.cs
+│   │   │   │   └── ChargePaymentJob.cs
+│   │   │   └── ...
+│   │   │
+│   │   └── Cart/
 │   │
 │   └── Medusa.API/
 │       ├── Program.cs
-│       ├── Middleware/
 │       └── appsettings.json
 │
 └── tests/
-    ├── Medusa.UnitTests/
-    └── Medusa.IntegrationTests/
+    └── Medusa.Tests/
+        ├── Products/
+        └── Orders/
 ```
 
-## Key Design Patterns
+## Technology Stack
 
-### 1. REPR (Request-Endpoint-Response)
-**MedusaJS:** Implicit via file-based routing
-**.NET:** Explicit with FastEndpoints
-
-```csharp
-// Request
-public class GetProductRequest
-{
-    public string Id { get; set; }
-}
-
-// Endpoint
-public class GetProductEndpoint : Endpoint<GetProductRequest, ProductResponse>
-{
-    public override async Task HandleAsync(GetProductRequest req, CancellationToken ct)
-    {
-        var product = await SendAsync(new GetProductQuery { Id = req.Id }, ct);
-        await SendAsync(new ProductResponse { Product = product }, ct);
-    }
-}
-
-// Response
-public class ProductResponse
-{
-    public Product Product { get; set; }
-}
-```
-
-### 2. VSA (Vertical Slice Architecture)
-**MedusaJS:** Modules (Product, Cart, Order)
-**.NET:** Feature folders
-
-```
-/Modules/Product/
-  /CreateProduct/
-    CreateProductEndpoint.cs
-    CreateProductRequest.cs
-    CreateProductResponse.cs
-    CreateProductValidator.cs
-    CreateProductWorkflow.cs
-  /GetProduct/
-    GetProductEndpoint.cs
-    ...
-```
-
-### 3. Repository Pattern
-**MedusaJS:** Generic `MikroOrmBaseRepository<T>`
-**.NET:** Generic `EfCoreRepository<T>`
-
-```csharp
-public interface IRepository<T> where T : class
-{
-    Task<T?> GetByIdAsync(string id, CancellationToken ct);
-    Task<List<T>> FindAsync(Expression<Func<T, bool>> predicate, CancellationToken ct);
-    Task<T> CreateAsync(T entity, CancellationToken ct);
-    Task UpdateAsync(T entity, CancellationToken ct);
-    Task DeleteAsync(string id, CancellationToken ct);
-}
-```
-
-### 4. Saga Pattern (Workflows)
-**MedusaJS:** Workflow + Steps with compensation
-**.NET:** MassTransit State Machine or WorkflowCore
-
-```csharp
-// WorkflowCore with compensation
-builder
-    .StartWith<ReserveInventoryStep>()
-        .CompensateWith<ReleaseInventoryStep>()
-    .Then<ChargePaymentStep>()
-        .CompensateWith<RefundPaymentStep>();
-```
-
-## Technology Stack Comparison
-
-| Layer | MedusaJS | .NET 10 |
-|-------|----------|---------|
-| **Runtime** | Node.js + TypeScript | .NET 10 + C# 12 |
-| **HTTP Framework** | Express | ASP.NET Core + FastEndpoints |
-| **DI Container** | Awilix | Built-in DI |
+| Layer | MedusaJS | .NET with FastEndpoints |
+|-------|----------|------------------------|
+| **HTTP** | Express | FastEndpoints (built-in) |
+| **DI** | Awilix | ASP.NET Core DI (built-in) |
 | **ORM** | MikroORM | Entity Framework Core |
 | **Database** | PostgreSQL | PostgreSQL (Npgsql) |
-| **Validation** | Zod | FluentValidation |
-| **Workflows** | Custom orchestration | MassTransit / WorkflowCore |
-| **Event Bus** | Custom + Redis | MassTransit + RabbitMQ |
-| **Jobs** | Custom + Redis | Hangfire / Quartz.NET |
-| **Logging** | Winston | Serilog / Microsoft.Extensions.Logging |
-| **Config** | Custom | Microsoft.Extensions.Configuration |
-| **Testing** | Jest | xUnit / NUnit |
+| **Validation** | Zod | FluentValidation (built-in) |
+| **Workflows** | Custom orchestration | Commands + Job Queues |
+| **Events** | Custom + Redis | Event Bus (built-in) |
+| **Jobs** | Custom + Redis | Job Queues (built-in) |
+| **Command Bus** | N/A | Command Bus (built-in) |
 
 ## Essential NuGet Packages
 
 ```xml
+<!-- FastEndpoints Core -->
 <PackageReference Include="FastEndpoints" Version="5.*" />
-<PackageReference Include="FluentValidation" Version="11.*" />
+
+<!-- Database -->
 <PackageReference Include="Npgsql.EntityFrameworkCore.PostgreSQL" Version="8.*" />
 <PackageReference Include="EFCore.NamingConventions" Version="8.*" />
+
+<!-- Logging -->
 <PackageReference Include="Serilog.AspNetCore" Version="8.*" />
-<PackageReference Include="MassTransit" Version="8.*" />
-<PackageReference Include="MassTransit.RabbitMQ" Version="8.*" />
-<PackageReference Include="WorkflowCore" Version="3.*" />
-<PackageReference Include="Hangfire" Version="1.*" />
-<PackageReference Include="MediatR" Version="12.*" />
-<PackageReference Include="Scrutor" Version="4.*" />
+
+<!-- Optional: Redis for Job Queue persistence -->
+<PackageReference Include="StackExchange.Redis" Version="2.*" />
+
+<!-- Testing -->
+<PackageReference Include="FastEndpoints.Testing" Version="5.*" />
+<PackageReference Include="xunit" Version="2.*" />
 ```
 
 ## Program.cs Setup
@@ -424,90 +451,180 @@ builder.Services.AddDbContext<MedusaDbContext>(options =>
     options.UseNpgsql(builder.Configuration.GetConnectionString("Medusa"))
         .UseSnakeCaseNamingConvention());
 
-// FastEndpoints
-builder.Services.AddFastEndpoints();
+// FastEndpoints with all features
+builder.Services
+    .AddFastEndpoints()
+    .AddJobQueues<JobRecord, EfCoreJobStorageProvider>(); // Job queues with EF Core
 
 // Authentication
-builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+builder.Services
+    .AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
     .AddJwtBearer(options => { /* config */ });
 
-// Modules
-builder.Services.AddProductModule();
-builder.Services.AddCartModule();
-builder.Services.AddOrderModule();
-
-// Workflows
-builder.Services.AddWorkflow<CreateProductWorkflow>();
-
-// MassTransit
-builder.Services.AddMassTransit(x =>
-{
-    x.UsingRabbitMq((context, cfg) =>
-    {
-        cfg.Host("rabbitmq://localhost");
-        cfg.ConfigureEndpoints(context);
-    });
-});
-
-// Hangfire
-builder.Services.AddHangfire(config =>
-    config.UsePostgreSqlStorage(builder.Configuration.GetConnectionString("Medusa")));
+// Domain Services
+builder.Services.AddScoped<IProductService, ProductService>();
+builder.Services.AddScoped<IOrderService, OrderService>();
+builder.Services.AddScoped(typeof(IRepository<>), typeof(EfCoreRepository<>));
 
 var app = builder.Build();
 
-// Middleware
-app.UseAuthentication();
-app.UseAuthorization();
-
 // FastEndpoints
-app.UseFastEndpoints();
-
-// Hangfire
-app.UseHangfireDashboard();
+app.UseAuthentication()
+   .UseAuthorization()
+   .UseFastEndpoints()
+   .UseJobQueues(o =>
+   {
+       o.MaxConcurrency = 4;  // Limit concurrent job execution
+       o.ExecutionTimeLimit = TimeSpan.FromMinutes(5);
+   });
 
 app.Run();
+```
+
+## Key Design Patterns
+
+### 1. Command Pattern (Replaces Simple Workflows)
+
+```csharp
+// Command
+public class UpdateInventoryCommand : ICommand<Result>
+{
+    public string ProductId { get; set; }
+    public int Quantity { get; set; }
+}
+
+// Handler
+public class UpdateInventoryHandler
+    : ICommandHandler<UpdateInventoryCommand, Result>
+{
+    public async Task<Result> ExecuteAsync(
+        UpdateInventoryCommand cmd,
+        CancellationToken ct)
+    {
+        // Business logic here
+        await _inventoryService.UpdateAsync(cmd.ProductId, cmd.Quantity, ct);
+        return Result.Success();
+    }
+}
+
+// Usage in endpoint
+var result = await new UpdateInventoryCommand
+{
+    ProductId = req.ProductId,
+    Quantity = req.Quantity
+}.ExecuteAsync(ct);
+```
+
+### 2. Event Bus Pattern (Replaces Event Subscribers)
+
+```csharp
+// Event
+public class OrderPlacedEvent : IEvent
+{
+    public string OrderId { get; set; }
+    public decimal Total { get; set; }
+}
+
+// Multiple Handlers (decoupled)
+public class SendOrderConfirmationHandler : IEventHandler<OrderPlacedEvent>
+{
+    public async Task HandleAsync(OrderPlacedEvent evt, CancellationToken ct)
+    {
+        await _emailService.SendOrderConfirmationAsync(evt.OrderId, ct);
+    }
+}
+
+public class UpdateAnalyticsHandler : IEventHandler<OrderPlacedEvent>
+{
+    public async Task HandleAsync(OrderPlacedEvent evt, CancellationToken ct)
+    {
+        await _analyticsService.TrackOrderAsync(evt.OrderId, evt.Total, ct);
+    }
+}
+
+// Publish (fire and forget or wait for all)
+await new OrderPlacedEvent
+{
+    OrderId = order.Id,
+    Total = order.Total
+}.PublishAsync(Mode.WaitForNone, ct);
+```
+
+### 3. Job Queue Pattern (Replaces Background Jobs)
+
+```csharp
+// Job Command
+public class SendEmailJob : ICommand
+{
+    public string To { get; set; }
+    public string Subject { get; set; }
+    public string Body { get; set; }
+}
+
+// Job Handler
+public class SendEmailJobHandler : ICommandHandler<SendEmailJob>
+{
+    public async Task ExecuteAsync(SendEmailJob job, CancellationToken ct)
+    {
+        await _emailService.SendAsync(job.To, job.Subject, job.Body, ct);
+    }
+}
+
+// Queue job (async execution)
+await new SendEmailJob
+{
+    To = "customer@example.com",
+    Subject = "Order Confirmation",
+    Body = "Your order has been placed"
+}.QueueJobAsync(ct);
+
+// Queue with delay
+await new SendEmailJob { ... }
+    .QueueJobAsync(
+        executeAfter: DateTime.UtcNow.AddMinutes(30),
+        expireOn: DateTime.UtcNow.AddHours(2),
+        ct);
 ```
 
 ## Migration Strategy
 
 ### Phase 1: Core Infrastructure
-1. Set up .NET project structure
-2. Configure Entity Framework Core with PostgreSQL
-3. Implement FastEndpoints for HTTP layer
-4. Set up DI container and module registration
+1. Set up .NET project with FastEndpoints
+2. Configure EF Core with PostgreSQL
+3. Set up job queue with EF Core storage provider
+4. Implement base repository pattern
 
 ### Phase 2: Data Layer
-1. Map MedusaJS entities to EF Core
-2. Implement generic repository pattern
-3. Create migrations from DML schemas
-4. Implement soft delete query filters
+1. Map entities to EF Core
+2. Create migrations
+3. Implement soft delete query filters
+4. Set up DbContext pooling
 
-### Phase 3: Business Logic
-1. Port domain services to .NET
-2. Implement workflows with WorkflowCore
-3. Set up MassTransit for events
-4. Configure Hangfire for background jobs
+### Phase 3: Features (VSA)
+1. Port endpoints to FastEndpoints REPR
+2. Convert workflows to Commands + Job Queues
+3. Convert event subscribers to Event Handlers
+4. Implement validation with FluentValidation
 
-### Phase 4: API Layer
-1. Create FastEndpoints for all routes
-2. Implement authentication/authorization
-3. Add request validation with FluentValidation
-4. Configure CORS and middleware pipeline
+### Phase 4: Testing
+1. Write integration tests with FastEndpoints.Testing
+2. Write unit tests for handlers
+3. Test job queue execution
+4. Test event pub/sub
 
-### Phase 5: Testing & Deployment
-1. Write unit tests (xUnit)
-2. Write integration tests
-3. Set up CI/CD
-4. Deploy to production
+## Key Differences from Commercial Libraries
 
-## Key Differences to Note
+**Why FastEndpoints over MassTransit/Hangfire:**
+1. **All-in-one**: Single library, consistent API
+2. **No commercial licensing**: 100% free, even for enterprise
+3. **Simpler setup**: Less configuration, faster dev
+4. **Better DX**: Strongly typed, no magic strings
+5. **Built-in testing**: Integrated test framework
 
-1. **Type Safety**: C# is statically typed vs TypeScript's structural typing
-2. **Async/Await**: C# requires explicit `async Task` vs TS implicit promises
-3. **DI**: .NET uses constructor injection primarily vs property injection in Awilix
-4. **Routing**: FastEndpoints is class-based vs file-based in Medusa
-5. **ORM**: EF Core has better LINQ support vs MikroORM's builder pattern
-6. **Workflows**: More mature libraries in .NET (MassTransit, WorkflowCore)
+**Trade-offs:**
+- FastEndpoints Event Bus is **in-process only** (fine for monoliths)
+- For distributed systems, use Redis pub/sub or SignalR
+- Job Queues need persistence setup (EF Core/Redis/MongoDB)
 
 ## References
 
@@ -517,11 +634,8 @@ app.Run();
 - `/packages/core/utils/src/dal/ANALYSIS.md` - Database Layer
 - `/packages/core/workflows-sdk/src/WORKFLOWS_ANALYSIS.md` - Workflow Engine
 
-**MedusaJS Documentation:**
-- https://docs.medusajs.com
-
-**.NET Resources:**
-- https://learn.microsoft.com/en-us/aspnet/core
-- https://fast-endpoints.com
-- https://masstransit.io
-- https://workflowcore.io
+**FastEndpoints Documentation:**
+- https://fast-endpoints.com/docs/command-bus
+- https://fast-endpoints.com/docs/event-bus
+- https://fast-endpoints.com/docs/job-queues
+- https://github.com/FastEndpoints/Job-Queue-EF-Core-Demo
